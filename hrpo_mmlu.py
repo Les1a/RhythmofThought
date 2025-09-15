@@ -92,7 +92,7 @@ def main(args):
         model = model,
         processing_class = tokenizer,
         reward_funcs = [
-            get_reward_func(process_mmlu_answer),
+            reward_func_mmlu,
         ],
         args = training_args,
         train_dataset = dataset,

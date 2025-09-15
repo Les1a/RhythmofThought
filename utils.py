@@ -1,5 +1,7 @@
 import re
 import string
+from math_verify import parse, verify
+
 
 ANSWER_START = "####"
 
@@ -36,43 +38,27 @@ def extract_boxed_answer(text: str) -> str | None:
         return None
 
 
-def get_reward_func(process_answer_func):
-    def reward_func(completions, answer, **kwargs) -> list[float]:
-        responses = [completion[0]["content"] for completion in completions]
+def reward_func_math(completions, answer, **kwargs) -> list[float]:
+    responses = [completion[0]["content"] for completion in completions]
 
-        ans = [process_answer_func(a) for a in answer]
-        extracted = [extract_from_response(r) for r in responses]
-        predictions = [process_answer_func(r) for r in extracted]
-        accuracy = [True if r == a else False for r, a in zip(predictions, ans)]
+    ans = [parse(a) for a in answer]
+    extracted = [extract_from_response(r) for r in responses]
+    predictions = [parse(r) for r in extracted]
+    accuracy = [verify(r, a) for r, a in zip(predictions, ans)]
 
-        escaped_answer_start = re.escape(ANSWER_START)
-        pattern = f"^(?:(?!{escaped_answer_start}).)*{escaped_answer_start}(?:(?!{escaped_answer_start}).)*$"
-        matches = [bool(re.search(pattern, r, re.DOTALL)) for r in responses]
+    escaped_answer_start = re.escape(ANSWER_START)
+    pattern = f"^(?:(?!{escaped_answer_start}).)*{escaped_answer_start}(?:(?!{escaped_answer_start}).)*$"
+    matches = [bool(re.search(pattern, r, re.DOTALL)) for r in responses]
 
-        rewards = [1.0 if a and m else 0.0 for a, m in zip(accuracy, matches)]
+    rewards = [1.0 if a and m else 0.0 for a, m in zip(accuracy, matches)]
 
-        print(
-            "=" * 50,
-            f"\nBatch accuracy: " + "".join("Y" if r > 0 else "N" for r in rewards),
-            f"\n1/{len(completions)} responses (answer: {ans[0]}):\n{responses[0]}",
-            "\n" + "=" * 50,
-        )
-        return rewards
-    
-    return reward_func
-
-
-# def exact_match(prediction, golden_answers):
-#     if isinstance(golden_answers, str):
-#         golden_answers = [golden_answers]
-#     normalized_prediction = normalize_answer(prediction)
-#     score = 0
-#     for golden_answer in golden_answers:
-#         golden_answer = normalize_answer(golden_answer)
-#         if golden_answer == normalized_prediction:
-#             score = 1
-#             break
-#     return score
+    print(
+        "=" * 50,
+        f"\nBatch accuracy: " + "".join("Y" if r > 0 else "N" for r in rewards),
+        f"\n1/{len(completions)} responses (answer: {ans[0]}):\n{responses[0]}",
+        "\n" + "=" * 50,
+    )
+    return rewards
 
 
 def reward_func_rag(completions, answer, **kwargs) -> list[float]:
@@ -100,6 +86,29 @@ def reward_func_rag(completions, answer, **kwargs) -> list[float]:
         "=" * 50,
         f"\nBatch accuracy: " + "".join("Y" if r > 0 else "N" for r in rewards),
         f"\n1/{len(completions)} responses (answer: {answer[0]}):\n{responses[0]}",
+        "\n" + "=" * 50,
+    )
+    return rewards
+
+
+def reward_func_mmlu(completions, answer, **kwargs) -> list[float]:
+    responses = [completion[0]["content"] for completion in completions]
+
+    ans = [process_mmlu_answer(a) for a in answer]
+    extracted = [extract_from_response(r) for r in responses]
+    predictions = [process_mmlu_answer(r) for r in extracted]
+    accuracy = [True if r == a else False for r, a in zip(predictions, ans)]
+
+    escaped_answer_start = re.escape(ANSWER_START)
+    pattern = f"^(?:(?!{escaped_answer_start}).)*{escaped_answer_start}(?:(?!{escaped_answer_start}).)*$"
+    matches = [bool(re.search(pattern, r, re.DOTALL)) for r in responses]
+
+    rewards = [1.0 if a and m else 0.0 for a, m in zip(accuracy, matches)]
+
+    print(
+        "=" * 50,
+        f"\nBatch accuracy: " + "".join("Y" if r > 0 else "N" for r in rewards),
+        f"\n1/{len(completions)} responses (answer: {ans[0]}):\n{responses[0]}",
         "\n" + "=" * 50,
     )
     return rewards

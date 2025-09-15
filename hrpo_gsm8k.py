@@ -90,7 +90,7 @@ def main(args):
         model = model,
         processing_class = tokenizer,
         reward_funcs = [
-            get_reward_func(process_gsm8k_answer),
+            reward_func_math,
         ],
         args = training_args,
         train_dataset = dataset,

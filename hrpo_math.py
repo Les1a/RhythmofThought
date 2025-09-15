@@ -103,7 +103,7 @@ def main(args):
         model = model,
         processing_class = tokenizer,
         reward_funcs = [
-            get_reward_func(process_math_answer),
+            reward_func_math,
         ],
         args = training_args,
         train_dataset = dataset,
@@ -136,8 +136,8 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--per_device_train_batch_size", type=int, default=16)
-    parser.add_argument("--max_prompt_length", type=int, default=1024)
-    parser.add_argument("--max_completion_length", type=int, default=1024)
+    parser.add_argument("--max_prompt_length", type=int, default=2048)
+    parser.add_argument("--max_completion_length", type=int, default=2048)
 
     parser.add_argument("--dataset_root", type=str, default="../MATH")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")

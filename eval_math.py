@@ -41,7 +41,7 @@ def evaluate_model(
 ):
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_path,
-        max_seq_length = 1536,
+        max_seq_length = 2048,
         load_in_4bit = False,
         fast_inference = False,
     )
@@ -113,7 +113,7 @@ def evaluate_model(
             generation_config=GenerationConfig(
                 do_sample=True,  # for temperature, top-k, etc.
                 temperature=temperature,
-                max_new_tokens=1024,
+                max_new_tokens=2048,
             ),
             processing_class=tokenizer,
             is_inference=is_inference,
@@ -128,14 +128,14 @@ def evaluate_model(
 
             # Extract the generated answer using XML tags
             extracted = extract_from_response(response)
-            generated_answer = process_math_answer(extracted)
+            generated_answer = parse(extracted)
             true_answer = extract_boxed_answer(batch_data['solution'][j])
-            true_answer = process_math_answer(true_answer)
-            print(generated_answer, true_answer, generated_answer == true_answer)
+            true_answer = parse(true_answer)
+            print(generated_answer, true_answer, verify(generated_answer, true_answer))
 
             if problems[j] in math500['problem']:
                 total_math500 += 1
-                if generated_answer == true_answer:
+                if verify(generated_answer, true_answer):
                     correct_math500 += 1
 
             # Store the result
@@ -144,11 +144,11 @@ def evaluate_model(
                 'true_answer': true_answer,
                 'generated_answer': generated_answer,
                 'full_response': response,
-                'correct': generated_answer == true_answer
+                'correct': verify(generated_answer, true_answer),
             }
             results.append(result)
 
-            if generated_answer == true_answer:
+            if verify(generated_answer, true_answer):
                 correct += 1
             total += 1
 
