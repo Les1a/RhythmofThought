@@ -5,6 +5,29 @@ from math_verify import parse, verify
 
 ANSWER_START = "####"
 
+BASE_MODELS = [
+    "Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-3B-Instruct",
+    "meta-llama/Llama-3.2-1B-Instruct", "meta-llama/Llama-3.2-3B-Instruct",
+]
+
+
+def detect_base_model(checkpoint_path, base_models=None):
+    if base_models is None:
+        base_models = BASE_MODELS
+    for model in base_models:
+        if model.split('/')[-1] in checkpoint_path:
+            return model
+    return None
+
+
+def create_eval_parser():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--no-greedy", dest="greedy", action="store_false", default=True)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--checkpoint_path", type=str, default=None)
+    return parser
+
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and "
     "the assistant solves it. The assistant first thinks about the reasoning "

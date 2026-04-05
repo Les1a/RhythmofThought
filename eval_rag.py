@@ -13,28 +13,29 @@ from tqdm import tqdm
 from utils import *
 
 
-def evaluate_model(
-    model_path: str,
-    adapter_path: str,
-    temperature: float,
-    is_inference: bool,
-    batch_size: int = 4,
-    num_samples: int = None,
-    save_results: bool = True,
-    dataset_code: str = 'nq',
-):
-    def get_prompt(question, contexts, topk=3):
-        prompt = "Context (which may or may not be relevant):\n"
-        for context in contexts[:topk]:
-            cur_context = context.split("\n")
-            cur_context[0] = cur_context[0].strip('"')
-            prompt += "::::".join(cur_context) + "\n"
-        prompt += f"\nQuestion: {question}"
-        return prompt
+def get_prompt(question, contexts, topk=3):
+    prompt = "Context (which may or may not be relevant):\n"
+    for context in contexts[:topk]:
+        cur_context = context.split("\n")
+        cur_context[0] = cur_context[0].strip('"')
+        prompt += "::::".join(cur_context) + "\n"
+    prompt += f"\nQuestion: {question}"
+    return prompt
 
+
+DATASET_PATHS = {
+    'nq': '../RAG_Eval/NQ_Eval',
+    'tq': '../RAG_Eval/TQ_Eval',
+    '2wiki': '../RAG_Eval/2Wiki_Eval',
+    'hotpotqa': '../RAG_Eval/HotpotQA_Eval',
+    'bamboogle': '../RAG_Eval/Bamboogle_Eval',
+}
+
+
+def load_model(model_path, adapter_path):
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_path,
-        max_seq_length = 1024,
+        max_seq_length = 3072,
         load_in_4bit = False,
         fast_inference = False,
     )
@@ -44,17 +45,21 @@ def evaluate_model(
 
     model.load_adapter(adapter_path)
     model = FastLanguageModel.for_inference(model)
+    return model, tokenizer
 
-    if dataset_code == 'nq':
-        dataset = Dataset.load_from_disk('../RAG_Eval/NQ_Eval')
-    elif dataset_code == 'tq':
-        dataset = Dataset.load_from_disk('../RAG_Eval/TQ_Eval')
-    elif dataset_code == '2wiki':
-        dataset = Dataset.load_from_disk('../RAG_Eval/2Wiki_Eval')
-    elif dataset_code == 'hotpotqa':
-        dataset = Dataset.load_from_disk('../RAG_Eval/HotpotQA_Eval')
-    elif dataset_code == 'bamboogle':
-        dataset = Dataset.load_from_disk('../RAG_Eval/Bamboogle_Eval')
+
+def evaluate_benchmark(
+    model,
+    tokenizer,
+    adapter_path: str,
+    temperature: float,
+    is_inference: bool,
+    batch_size: int = 4,
+    num_samples: int = None,
+    save_results: bool = True,
+    dataset_code: str = 'nq',
+):
+    dataset = Dataset.load_from_disk(DATASET_PATHS[dataset_code])
 
     if num_samples and len(dataset) > num_samples:
         dataset = dataset.shuffle(seed=42).select(range(num_samples))
@@ -106,7 +111,7 @@ def evaluate_model(
 
         # Generate responses
         outputs = model.generate(
-            prompt_ids, attention_mask=prompt_mask, 
+            prompt_ids, attention_mask=prompt_mask,
             generation_config=GenerationConfig(
                 do_sample=True,  # for temperature, top-k, etc.
                 temperature=temperature,
@@ -170,84 +175,31 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--greedy", type=bool, default=True)
-    parser.add_argument("--batch_size", type=int, default=32)
+    from utils import detect_base_model, create_eval_parser
+
+    parser = create_eval_parser()
     parser.add_argument("--eval_examples", type=int, default=None)
-    parser.add_argument("--checkpoint_path", type=str, default=None)
     args = parser.parse_args()
 
-    base_model = None
     checkpoint_path = args.checkpoint_path
-    base_models = ["Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-3B-Instruct"]
-    for model in base_models:
-        if model.split('/')[-1] in checkpoint_path:
-            base_model = model
+    base_model = detect_base_model(checkpoint_path)
     temperature = float(checkpoint_path.split('-temp')[-1].split('/')[0])
     print(checkpoint_path, base_model, temperature)
 
-    if 'eval_results_nq.json' not in os.listdir(checkpoint_path):
-        print(f"Starting NQ evaluation on {checkpoint_path}")
-        metrics = evaluate_model(
-            model_path=base_model,
-            adapter_path=checkpoint_path,
-            temperature=temperature,
-            is_inference=args.greedy,
-            batch_size=args.batch_size,
-            num_samples=args.eval_examples,
-            save_results=True,
-            dataset_code='nq',
-        )
+    model, tokenizer = load_model(base_model, checkpoint_path)
 
-    if 'eval_results_tq.json' not in os.listdir(checkpoint_path):
-        print(f"Starting TQ evaluation on {checkpoint_path}")
-        metrics = evaluate_model(
-            model_path=base_model,
-            adapter_path=checkpoint_path,
-            temperature=temperature,
-            is_inference=args.greedy,
-            batch_size=args.batch_size,
-            num_samples=args.eval_examples,
-            save_results=True,
-            dataset_code='tq',
-        )
-
-    if 'eval_results_2wiki.json' not in os.listdir(checkpoint_path):
-        print(f"Starting 2Wiki evaluation on {checkpoint_path}")
-        metrics = evaluate_model(
-            model_path=base_model,
-            adapter_path=checkpoint_path,
-            temperature=temperature,
-            is_inference=args.greedy,
-            batch_size=args.batch_size,
-            num_samples=args.eval_examples,
-            save_results=True,
-            dataset_code='2wiki',
-        )
-
-    if 'eval_results_hotpotqa.json' not in os.listdir(checkpoint_path):
-        print(f"Starting HotpotQA evaluation on {checkpoint_path}")
-        metrics = evaluate_model(
-            model_path=base_model,
-            adapter_path=checkpoint_path,
-            temperature=temperature,
-            is_inference=args.greedy,
-            batch_size=args.batch_size,
-            num_samples=args.eval_examples,
-            save_results=True,
-            dataset_code='hotpotqa',
-        )
-
-    if 'eval_results_bamboogle.json' not in os.listdir(checkpoint_path):
-        print(f"Starting Bamboogle evaluation on {checkpoint_path}")
-        metrics = evaluate_model(
-            model_path=base_model,
-            adapter_path=checkpoint_path,
-            temperature=temperature,
-            is_inference=args.greedy,
-            batch_size=args.batch_size,
-            num_samples=args.eval_examples,
-            save_results=True,
-            dataset_code='bamboogle',
-        )
+    for dataset_code in ['nq', 'tq', '2wiki', 'hotpotqa', 'bamboogle']:
+        results_file = f'eval_results_{dataset_code}.json'
+        if not os.path.exists(os.path.join(checkpoint_path, results_file)):
+            print(f"Starting {dataset_code} evaluation on {checkpoint_path}")
+            metrics = evaluate_benchmark(
+                model=model,
+                tokenizer=tokenizer,
+                adapter_path=checkpoint_path,
+                temperature=temperature,
+                is_inference=args.greedy,
+                batch_size=args.batch_size,
+                num_samples=args.eval_examples,
+                save_results=True,
+                dataset_code=dataset_code,
+            )

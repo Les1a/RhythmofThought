@@ -108,19 +108,20 @@ def evaluate_model(
             generated_answer = parse(extracted)
             true_answer = extract_hash_answer(batch_data['answer'][j])
             true_answer = parse(true_answer)
-            print(generated_answer, true_answer, verify(generated_answer, true_answer))
+            is_correct = bool(verify(generated_answer, true_answer))
+            print(generated_answer, true_answer, is_correct)
 
             # Store the result
             result = {
                 'question': batch_data['question'][j],
-                'true_answer': true_answer,
-                'generated_answer': generated_answer,
+                'true_answer': str(true_answer),
+                'generated_answer': str(generated_answer),
                 'full_response': response,
-                'correct': verify(generated_answer, true_answer),
+                'correct': is_correct,
             }
             results.append(result)
 
-            if verify(generated_answer, true_answer):
+            if is_correct:
                 correct += 1
             total += 1
 
@@ -150,23 +151,15 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--greedy", type=bool, default=True)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--checkpoint_path", type=str, default=None)
-    args = parser.parse_args()
+    from utils import detect_base_model, create_eval_parser
 
-    base_model = None
+    args = create_eval_parser().parse_args()
     checkpoint_path = args.checkpoint_path
-    base_models = ["Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-3B-Instruct"]
-    for model in base_models:
-        if model.split('/')[-1] in checkpoint_path:
-            base_model = model
+    base_model = detect_base_model(checkpoint_path)
     temperature = float(checkpoint_path.split('-temp')[-1].split('/')[0])
     print(checkpoint_path, base_model, temperature)
 
-    if 'eval_results.json' not in os.listdir(checkpoint_path):
+    if not os.path.exists(os.path.join(checkpoint_path, 'eval_results.json')):
         print(f"Starting GSM8k evaluation on {checkpoint_path}")
         metrics = evaluate_model(
             model_path=base_model,

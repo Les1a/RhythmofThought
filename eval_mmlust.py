@@ -30,7 +30,7 @@ def evaluate_model(
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_path,
-        max_seq_length = 1024,
+        max_seq_length = 2048,
         load_in_4bit = False,
         fast_inference = False,
     )
@@ -164,23 +164,15 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--greedy", type=bool, default=True)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--checkpoint_path", type=str, default=None)
-    args = parser.parse_args()
+    from utils import detect_base_model, create_eval_parser
 
-    base_model = None
+    args = create_eval_parser().parse_args()
     checkpoint_path = args.checkpoint_path
-    base_models = ["Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-3B-Instruct"]
-    for model in base_models:
-        if model.split('/')[-1] in checkpoint_path:
-            base_model = model
+    base_model = detect_base_model(checkpoint_path)
     temperature = float(checkpoint_path.split('-temp')[-1].split('/')[0])
     print(checkpoint_path, base_model, temperature)
 
-    if 'eval_results_mmlust.json' not in os.listdir(checkpoint_path):
+    if not os.path.exists(os.path.join(checkpoint_path, 'eval_results_mmlust.json')):
         print(f"Starting MMLU-STEM evaluation on {checkpoint_path}")
         metrics = evaluate_model(
             model_path=base_model,

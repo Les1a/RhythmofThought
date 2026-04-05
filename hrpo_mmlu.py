@@ -16,8 +16,12 @@ os.environ["WANDB_PROJECT"] = "latent-reasoning"
 
 def preprocess_mmlu(chunk_size=1000, root='../MMLU_Train_Merged') -> Dataset:
     dataset = Dataset.load_from_disk(root)
-    processed = dataset.map(process_mmlu, batched=True, 
-                            batch_size=chunk_size, load_from_cache_file=False)
+    # Cast ClassLabel answer to string to avoid auto-conversion back to int
+    from datasets import Value
+    dataset = dataset.cast_column("answer", Value("int32"))
+    processed = dataset.map(process_mmlu, batched=True,
+                            batch_size=chunk_size, load_from_cache_file=False,
+                            remove_columns=dataset.column_names)
     return processed
 
 

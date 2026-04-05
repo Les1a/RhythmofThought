@@ -41,7 +41,7 @@ def evaluate_model(
 ):
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_path,
-        max_seq_length = 2048,
+        max_seq_length = 4096,
         load_in_4bit = False,
         fast_inference = False,
     )
@@ -54,6 +54,7 @@ def evaluate_model(
 
     dataset = preprocess_math('test', chunk_size=500)
     math500 = load_dataset('HuggingFaceH4/MATH-500')['test']
+    math500_problems = set(math500['problem'])
 
     if num_samples and len(dataset) > num_samples:
         dataset = dataset.shuffle(seed=42).select(range(num_samples))
@@ -103,8 +104,8 @@ def evaluate_model(
             formatted_prompts, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
-        prompt_ids = prompt_ids[:, -512:].to(model.device)
-        prompt_mask = prompt_mask[:, -512:].to(model.device)
+        prompt_ids = prompt_ids.to(model.device)
+        prompt_mask = prompt_mask.to(model.device)
         prompt_length = prompt_ids.size(1)
 
         # Generate responses
@@ -131,24 +132,25 @@ def evaluate_model(
             generated_answer = parse(extracted)
             true_answer = extract_boxed_answer(batch_data['solution'][j])
             true_answer = parse(true_answer)
-            print(generated_answer, true_answer, verify(generated_answer, true_answer))
+            is_correct = bool(verify(generated_answer, true_answer))
+            print(generated_answer, true_answer, is_correct)
 
-            if problems[j] in math500['problem']:
+            if problems[j] in math500_problems:
                 total_math500 += 1
-                if verify(generated_answer, true_answer):
+                if is_correct:
                     correct_math500 += 1
 
             # Store the result
             result = {
                 'question': batch_data['problem'][j],
-                'true_answer': true_answer,
-                'generated_answer': generated_answer,
+                'true_answer': str(true_answer),
+                'generated_answer': str(generated_answer),
                 'full_response': response,
-                'correct': verify(generated_answer, true_answer),
+                'correct': is_correct,
             }
             results.append(result)
 
-            if verify(generated_answer, true_answer):
+            if is_correct:
                 correct += 1
             total += 1
 
@@ -182,23 +184,15 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--greedy", type=bool, default=True)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--checkpoint_path", type=str, default=None)
-    args = parser.parse_args()
+    from utils import detect_base_model, create_eval_parser
 
-    base_model = None
+    args = create_eval_parser().parse_args()
     checkpoint_path = args.checkpoint_path
-    base_models = ["Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-3B-Instruct"]
-    for model in base_models:
-        if model.split('/')[-1] in checkpoint_path:
-            base_model = model
+    base_model = detect_base_model(checkpoint_path)
     temperature = float(checkpoint_path.split('-temp')[-1].split('/')[0])
     print(checkpoint_path, base_model, temperature)
 
-    if 'eval_results.json' not in os.listdir(checkpoint_path):
+    if not os.path.exists(os.path.join(checkpoint_path, 'eval_results.json')):
         print(f"Starting MATH evaluation on {checkpoint_path}")
         metrics = evaluate_model(
             model_path=base_model,
