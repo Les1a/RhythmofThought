@@ -32,14 +32,15 @@ DATASET_PATHS = {
 }
 
 
-def load_model(model_path, adapter_path):
+def load_model(model_path, adapter_path, only_grpo=False):
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_path,
         max_seq_length = 3072,
         load_in_4bit = False,
         fast_inference = False,
     )
-    model.answer_start = ANSWER_START
+    if not only_grpo:
+        model.answer_start = ANSWER_START
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -186,7 +187,7 @@ if __name__ == "__main__":
     temperature = float(checkpoint_path.split('-temp')[-1].split('/')[0])
     print(checkpoint_path, base_model, temperature)
 
-    model, tokenizer = load_model(base_model, checkpoint_path)
+    model, tokenizer = load_model(base_model, checkpoint_path, only_grpo=args.only_grpo)
 
     for dataset_code in ['nq', 'tq', '2wiki', 'hotpotqa', 'bamboogle']:
         results_file = f'eval_results_{dataset_code}.json'

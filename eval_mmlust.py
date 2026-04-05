@@ -21,6 +21,7 @@ def evaluate_model(
     batch_size: int = 4,
     num_samples: int = None,
     save_results: bool = True,
+    only_grpo: bool = False,
 ):
     def get_prompt(question, choices):
         prompt = f"Question: {question}\nOptions:\n"
@@ -34,7 +35,8 @@ def evaluate_model(
         load_in_4bit = False,
         fast_inference = False,
     )
-    model.answer_start = ANSWER_START
+    if not only_grpo:
+        model.answer_start = ANSWER_START
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -182,4 +184,5 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             num_samples=None,
             save_results=True,
+            only_grpo=args.only_grpo,
         )

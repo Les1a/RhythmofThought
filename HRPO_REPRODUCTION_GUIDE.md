@@ -327,14 +327,19 @@ Shared across all four training scripts:
 All training scripts generate output directories with this pattern:
 
 ```
+# HRPO (default)
 ./experiments/{model_short}-{task}-group{G}-lora{R}-rmin{MIN}-temp{T}
+
+# GRPO baseline (--only_grpo)
+./experiments/{model_short}-{task}-grpo-group{G}-lora{R}-temp{T}
 ```
 
 Examples:
-- `./experiments/Qwen2.5-1.5B-Instruct-gsm8k-group4-lora32-rmin0.99-temp0.5`
-- `./experiments/Qwen2.5-3B-Instruct-math-group8-lora32-rmin0.99-temp0.5`
+- `./experiments/Qwen2.5-1.5B-Instruct-gsm8k-group4-lora32-rmin0.99-temp0.5` (HRPO)
+- `./experiments/Qwen2.5-1.5B-Instruct-gsm8k-grpo-group4-lora32-temp0.5` (GRPO)
+- `./experiments/Qwen2.5-3B-Instruct-math-group8-lora32-rmin0.99-temp0.5` (HRPO)
 
-Training scripts check if the experiment directory already exists and contains files -- if so, they exit to prevent accidental overwrites. Checkpoints are saved as `checkpoint-{step}` subdirectories.
+GRPO directories use `-grpo-` in the name and omit `-rmin{MIN}` (not applicable). Training scripts check if the experiment directory already exists and contains files -- if so, they exit to prevent accidental overwrites. Checkpoints are saved as `checkpoint-{step}` subdirectories.
 
 ---
 
@@ -386,7 +391,7 @@ Each must be a HuggingFace `Dataset` saved via `save_to_disk()` with columns: `q
 All eval scripts follow the same flow:
 
 1. Load base model via `FastLanguageModel.from_pretrained()` (no 4-bit, `fast_inference=False`)
-2. Set `model.answer_start = ANSWER_START` (`"####"`)
+2. Set `model.answer_start = ANSWER_START` (`"####"`) — **skipped when `--only_grpo` is passed** (disables thinking residual blending during generation)
 3. Load trained LoRA adapter via `model.load_adapter(adapter_path)`
 4. Switch to inference mode via `FastLanguageModel.for_inference(model)`
 5. Load evaluation dataset
@@ -420,9 +425,12 @@ All eval scripts share these arguments:
 | `--checkpoint_path` | str | None | Path to the trained checkpoint directory (required) |
 | `--batch_size` | int | 32 | Evaluation batch size |
 | `--no-greedy` | flag | _(off)_ | Disable greedy decoding (default: greedy/`is_inference=True`) |
+| `--only_grpo` | flag | _(off)_ | Evaluate a GRPO baseline checkpoint (skip `model.answer_start`, no thinking residual) |
 
 `eval_rag.py` has an additional argument:
 - `--eval_examples` (int, default=None): Limit number of evaluation examples per benchmark
+
+**Important:** When evaluating GRPO checkpoints, always pass `--only_grpo`. Without it, the thinking residual modules (which exist in the model architecture but were not trained) would be applied with random weights, corrupting the output.
 
 ### 5.4 Automatic Base Model and Temperature Detection
 
@@ -472,9 +480,14 @@ CUDA_VISIBLE_DEVICES=0 python eval_arcc.py \
 
 ---
 
-## 6. Unified Pipeline: `run_hrpo_all.sh`
+## 6. Unified Pipeline: `run_hrpo_all.sh` & `run_grpo_all.sh`
 
-`run_hrpo_all.sh` is a unified script that orchestrates training and evaluation across all tasks with smart skip logic.
+Two unified scripts orchestrate training and evaluation across all tasks with smart skip logic:
+
+- **`run_hrpo_all.sh`** — HRPO training (with thinking residual)
+- **`run_grpo_all.sh`** — GRPO baseline (vanilla GRPO, no thinking residual)
+
+Both scripts accept the same CLI options and share identical hyperparameters (LR, beta, LoRA rank, batch sizes, etc.). The only difference is that `run_grpo_all.sh` passes `--only_grpo` to all training and eval scripts, which disables the thinking-residual-specific components.
 
 ### 6.1 CLI Options
 
@@ -525,6 +538,8 @@ The script defaults to H200-optimized settings (maximize BS, set GA=1 to elimina
 ### 6.5 Usage Examples
 
 ```bash
+# ---- HRPO (with thinking residual) ----
+
 # Run everything with default settings (H200-optimized)
 bash run_hrpo_all.sh
 
@@ -542,6 +557,21 @@ bash run_hrpo_all.sh --dry-run
 
 # Train with a different model
 bash run_hrpo_all.sh --model Qwen/Qwen2.5-3B-Instruct --tasks gsm8k
+
+# ---- GRPO Baseline (no thinking residual) ----
+
+# Run GRPO baseline on all tasks
+bash run_grpo_all.sh
+
+# GRPO on GSM8K only
+bash run_grpo_all.sh --gpu 1 --tasks gsm8k
+
+# GRPO dry run
+bash run_grpo_all.sh --dry-run --tasks gsm8k
+
+# Or run GRPO directly via the training script
+CUDA_VISIBLE_DEVICES=0 python hrpo_gsm8k.py --only_grpo \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct --group_size 4
 ```
 
 ---
@@ -753,10 +783,68 @@ Full argparse arguments (shared by all training scripts):
 | `--max_completion_length` | int | 1024 or 2048 | Max completion tokens |
 | `--seed` | int | 42 | Random seed |
 | `--dataset_root` | str | varies | Dataset path (MATH/MMLU/RAG only) |
+| `--only_grpo` | flag | _(off)_ | Run as vanilla GRPO baseline (disables all thinking residual components) |
 
 ---
 
-## 12. Project File Structure
+## 12. GRPO Baseline Mode (`--only_grpo`)
+
+All training scripts (`hrpo_*.py`) and eval scripts (`eval_*.py`) support a `--only_grpo` flag that disables the thinking residual mechanism, reducing HRPO to vanilla GRPO. This enables fair ablation comparisons on the same codebase.
+
+### 12.1 What `--only_grpo` Disables
+
+When `--only_grpo` is passed to a training script, the following HRPO-specific components are skipped:
+
+| Component | HRPO (default) | GRPO (`--only_grpo`) |
+|-----------|---------------|---------------------|
+| `model.answer_start` | Set to `"####"` — enables thinking/answer mode switching during generation | **Not set** — generation runs without thinking residual blending |
+| `modules_to_save` | `[thinking_residual_gate_r, gate_i, Lambda]` — these modules are trained and saved | **`None`** — only LoRA adapters are trained/saved |
+| `reset_lambda_parameters()` | Lambda initialized with `[r_min, r_max]` | **Skipped** — Lambda stays at random init (irrelevant since not used) |
+| `patch_trainer_optimizer()` | 4 param groups with separate LRs for gate and Lambda | **Skipped** — standard optimizer with 2 param groups (decay / no decay) |
+
+### 12.2 Generation Code Guard
+
+The modified `transformers/generation/utils.py` guards the thinking-state computation with:
+
+```python
+if getattr(self, 'answer_start', None) is not None:
+    # compute is_thinking, last_thinking_states ...
+```
+
+When `answer_start` is not set (GRPO mode), `is_thinking` and `last_thinking_states` remain `None` (initialized at the top of the generation loop). They are never passed to the model forward, so no thinking residual blending occurs. This guard is the safety net that prevents crashes and ensures clean GRPO generation.
+
+### 12.3 Running GRPO Baseline
+
+```bash
+# Via unified pipeline (recommended)
+bash run_grpo_all.sh --tasks gsm8k,math --no-wandb
+
+# Via individual scripts
+CUDA_VISIBLE_DEVICES=0 python hrpo_gsm8k.py --only_grpo \
+  --model_name Qwen/Qwen2.5-1.5B-Instruct --group_size 4
+
+# Evaluate GRPO checkpoint (must pass --only_grpo)
+CUDA_VISIBLE_DEVICES=0 python eval_gsm8k.py --only_grpo \
+  --checkpoint_path ./experiments/Qwen2.5-1.5B-Instruct-gsm8k-grpo-group4-lora32-temp0.5/checkpoint-250
+```
+
+### 12.4 HRPO vs GRPO Experiment Directories
+
+HRPO and GRPO experiments are saved to different directories, so both can coexist under `./experiments/`:
+
+```
+experiments/
+|-- Qwen2.5-1.5B-Instruct-gsm8k-group4-lora32-rmin0.99-temp0.5/       # HRPO
+|   |-- checkpoint-250/
+|   |-- checkpoint-500/
+|-- Qwen2.5-1.5B-Instruct-gsm8k-grpo-group4-lora32-temp0.5/           # GRPO
+|   |-- checkpoint-250/
+|   |-- checkpoint-500/
+```
+
+---
+
+## 13. Project File Structure
 
 ```
 hrpo-trl/
@@ -771,7 +859,8 @@ hrpo-trl/
 |-- eval_arcc.py            # Eval: ARC-Challenge (+ OpenBookQA, QASC)
 |-- patch.py                # Custom optimizer patching (4 param groups)
 |-- utils.py                # Reward functions, answer parsing, data processing
-|-- run_hrpo_all.sh         # Unified pipeline: train + eval all tasks
+|-- run_hrpo_all.sh         # Unified pipeline: HRPO train + eval all tasks
+|-- run_grpo_all.sh         # Unified pipeline: GRPO baseline train + eval all tasks
 |-- transformers/           # Modified HF Transformers (ThinkingResidual + generation logic)
 |   |-- models/qwen2/modeling_qwen2.py    # ThinkingResidualLambda + gating (Qwen2)
 |   |-- models/llama/modeling_llama.py     # ThinkingResidualLambda + gating (LLaMA)
@@ -785,7 +874,7 @@ hrpo-trl/
 
 ---
 
-## 13. Summary: What Makes HRPO Different
+## 14. Summary: What Makes HRPO Different
 
 1. **No explicit CoT required:** HRPO enables latent reasoning without generating reasoning tokens visible to the user
 2. **Gated residual connection:** A GRU-inspired gate blends hidden states into embeddings with learnable parameters

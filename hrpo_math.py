@@ -33,8 +33,12 @@ def preprocess_math(split="train", chunk_size=1000, root='../MATH') -> Dataset:
 
 
 def main(args):
-    exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-math-group{args.group_size}"
-                f"-lora{args.lora_rank}-rmin{args.residual_r_min}-temp{args.temperature}")
+    if args.only_grpo:
+        exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-math-grpo-group{args.group_size}"
+                    f"-lora{args.lora_rank}-temp{args.temperature}")
+    else:
+        exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-math-group{args.group_size}"
+                    f"-lora{args.lora_rank}-rmin{args.residual_r_min}-temp{args.temperature}")
     if os.path.exists(exp_name) and len(os.listdir(exp_name)) > 0:
         print(f"Experiment {exp_name} already exists. Exiting...")
         exit()
@@ -46,11 +50,17 @@ def main(args):
         load_in_8bit = False,
         fast_inference = False,
     )
-    model.answer_start = ANSWER_START
+    if not args.only_grpo:
+        model.answer_start = ANSWER_START
 
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
+    modules_to_save = None if args.only_grpo else [
+        "thinking_residual_gate_r",
+        "thinking_residual_gate_i",
+        "thinking_residual_Lambda",
+    ]
     model = FastLanguageModel.get_peft_model(
         model,
         r = args.lora_rank,
@@ -58,18 +68,15 @@ def main(args):
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
-        modules_to_save = [
-            "thinking_residual_gate_r",
-            "thinking_residual_gate_i",
-            "thinking_residual_Lambda",
-        ], 
+        modules_to_save = modules_to_save,
         lora_alpha = args.lora_rank * 2,
         use_gradient_checkpointing = "unsloth",
         random_state = args.seed,
     )
-    model.model.model.thinking_residual_Lambda.reset_lambda_parameters(
-        r_min = args.residual_r_min, r_max = args.residual_r_max,
-    )
+    if not args.only_grpo:
+        model.model.model.thinking_residual_Lambda.reset_lambda_parameters(
+            r_min = args.residual_r_min, r_max = args.residual_r_max,
+        )
 
     training_args = GRPOConfig(
         use_vllm = False,
@@ -108,11 +115,12 @@ def main(args):
         args = training_args,
         train_dataset = dataset,
     )
-    patch_trainer_optimizer(
-        trainer,
-        args.lr_residual_gate,
-        args.lr_residual_Lambda,
-    )
+    if not args.only_grpo:
+        patch_trainer_optimizer(
+            trainer,
+            args.lr_residual_gate,
+            args.lr_residual_Lambda,
+        )
     trainer.train()
 
 
@@ -142,6 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_root", type=str, default="../MATH")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--only_grpo", action="store_true", default=False)
     args = parser.parse_args()
 
     # "Qwen/Qwen2.5-1.5B-Instruct"

@@ -3364,12 +3364,13 @@ class GenerationMixin:
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
 
-            strs = processing_class.batch_decode(input_ids[:, input_len:])
-            is_thinking = [self.answer_start not in s for s in strs]
-            last_thinking_states = torch.einsum(
-                'bv,vd->bd', probs, self.get_input_embeddings().weight
-            )
-            last_thinking_states /= torch.sqrt((probs ** 2).sum(-1, keepdim=True)).to(last_thinking_states.dtype)
+            if getattr(self, 'answer_start', None) is not None:
+                strs = processing_class.batch_decode(input_ids[:, input_len:])
+                is_thinking = [self.answer_start not in s for s in strs]
+                last_thinking_states = torch.einsum(
+                    'bv,vd->bd', probs, self.get_input_embeddings().weight
+                )
+                last_thinking_states /= torch.sqrt((probs ** 2).sum(-1, keepdim=True)).to(last_thinking_states.dtype)
 
             if return_thinking_embeds and outputs.hidden_states is not None:
                 thinking_embeds.append(outputs.hidden_states[0].unsqueeze(1))
