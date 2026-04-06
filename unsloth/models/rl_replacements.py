@@ -452,6 +452,11 @@ def grpo_trainer_compute_loss(function_name, function):
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         thinking_embeds, thinking_mask = inputs["thinking_embeds"], inputs["thinking_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        # When thinking is not active (e.g. only_grpo), thinking_mask only covers
+        # prompt tokens and won't match the full input_ids length — disable it.
+        if thinking_mask is not None and thinking_mask.shape[1] != input_ids.shape[1]:
+            thinking_embeds = None
+            thinking_mask = None
         bsz, qlen = input_ids.shape
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         # attention_mask = None
@@ -490,8 +495,12 @@ def grpo_trainer_compute_loss(function_name, function):
 
         embeds_ratio = inputs["embeds_ratio"]
         embeds_ratio_mask = embeds_ratio < 1.
-        mean_embeds_ratio = embeds_ratio[embeds_ratio_mask].mean()
-        mean_hidden_ratio = torch.sqrt(1 - embeds_ratio[embeds_ratio_mask] ** 2).mean()
+        if embeds_ratio_mask.any():
+            mean_embeds_ratio = embeds_ratio[embeds_ratio_mask].mean()
+            mean_hidden_ratio = torch.sqrt(1 - embeds_ratio[embeds_ratio_mask] ** 2).mean()
+        else:
+            mean_embeds_ratio = torch.tensor(1.0)
+            mean_hidden_ratio = torch.tensor(0.0)
 
         if "train" in self._metrics:
             mode = "eval" if self.control.should_evaluate else "train"

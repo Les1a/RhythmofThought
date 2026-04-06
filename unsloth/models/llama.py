@@ -1022,7 +1022,7 @@ def LlamaModel_fast_forward_inference(
     return BaseModelOutputWithPast(
         last_hidden_state = X,
         past_key_values = next_decoder_cache,
-        hidden_states = [] if is_thinking is None else [thinking_embeds, is_thinking, embeds_ratio],
+        hidden_states = None if is_thinking is None else [thinking_embeds, is_thinking, embeds_ratio],
         attentions = [],
     )
 pass

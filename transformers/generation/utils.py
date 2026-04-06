@@ -3372,7 +3372,7 @@ class GenerationMixin:
                 )
                 last_thinking_states /= torch.sqrt((probs ** 2).sum(-1, keepdim=True)).to(last_thinking_states.dtype)
 
-            if return_thinking_embeds and outputs.hidden_states is not None:
+            if return_thinking_embeds and outputs.hidden_states:
                 thinking_embeds.append(outputs.hidden_states[0].unsqueeze(1))
                 thinking_mask.append(
                     torch.tensor(outputs.hidden_states[1], device=input_ids.device).unsqueeze(1)
