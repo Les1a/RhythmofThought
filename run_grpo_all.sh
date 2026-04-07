@@ -6,7 +6,9 @@
 # GSM8K, MATH, MMLU, and RAG tasks, using the same hyperparameters as HRPO
 # minus the thinking-residual-specific components.
 #
-# Smart skipping — won't re-train if checkpoints exist, won't re-eval if results exist.
+# Smart skipping — by default won't re-train if checkpoints exist, won't re-eval if
+# results exist. Pass --resume to continue training from the latest checkpoint
+# instead of skipping (full state restore: optimizer, scheduler, RNG, global_step).
 #
 # Usage:
 #   bash run_grpo_all.sh [OPTIONS]
@@ -18,6 +20,10 @@
 #   --paper-params        Use paper-original batch sizes instead of H200-optimized
 #   --eval-only           Skip training, only evaluate existing checkpoints
 #   --skip-eval           Skip evaluation after training
+#   --resume              Resume training from the latest checkpoint in each task's
+#                         experiment dir instead of skipping. Errors if a task's
+#                         experiment dir is missing or contains no checkpoint-*.
+#                         Hyperparameters must match the original run.
 #   --no-wandb            Disable WandB logging
 #   --dry-run             Print commands without executing
 #   --help                Show this help message
@@ -56,6 +62,7 @@ EVAL_ONLY=false
 SKIP_EVAL=false
 NO_WANDB=false
 DRY_RUN=false
+RESUME=false
 FAILED_TASKS=()
 
 # ========================= Argument Parsing ==================================
@@ -78,6 +85,7 @@ while [[ $# -gt 0 ]]; do
             shift ;;
         --eval-only)  EVAL_ONLY=true; shift ;;
         --skip-eval)  SKIP_EVAL=true; shift ;;
+        --resume)     RESUME=true; shift ;;
         --no-wandb)   NO_WANDB=true; shift ;;
         --dry-run)    DRY_RUN=true; shift ;;
         --help|-h)    show_help ;;
@@ -169,16 +177,25 @@ train_gsm8k() {
     log "$task" "Experiment: ${exp_name}"
     log "$task" "Effective batch size: $((GSM8K_BS * GSM8K_GA)) (BS=${GSM8K_BS} x GA=${GSM8K_GA})"
 
+    local resume_arg=""
     if [ -d "$exp_name" ] && ls "${exp_name}"/checkpoint-* &>/dev/null; then
-        log "$task" "Checkpoint already exists, skipping training"
-        return 0
+        if [ "$RESUME" = true ]; then
+            log "$task" "Resuming training from latest checkpoint in ${exp_name}"
+            resume_arg="--resume"
+        else
+            log "$task" "Checkpoint already exists, skipping training (use --resume to continue)"
+            return 0
+        fi
+    elif [ "$RESUME" = true ]; then
+        log "$task" "ERROR: --resume specified but no checkpoint found in ${exp_name}"
+        return 1
     fi
 
     local logfile="${LOG_DIR}/grpo_gsm8k_train_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_gsm8k.py \\"
-        echo "    --only_grpo \\"
+        echo "    --only_grpo${resume_arg:+ ${resume_arg}} \\"
         echo "    --per_device_train_batch_size ${GSM8K_BS} --gradient_accumulation_steps ${GSM8K_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 1024 --max_completion_length 1024 \\"
         echo "    $(common_train_args)"
@@ -187,6 +204,7 @@ train_gsm8k() {
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_gsm8k.py \
         --only_grpo \
+        ${resume_arg} \
         --per_device_train_batch_size ${GSM8K_BS} \
         --gradient_accumulation_steps ${GSM8K_GA} \
         --group_size ${group_size} \
@@ -215,16 +233,25 @@ train_math() {
     log "$task" "Experiment: ${exp_name}"
     log "$task" "Effective batch size: $((MATH_BS * MATH_GA)) (BS=${MATH_BS} x GA=${MATH_GA})"
 
+    local resume_arg=""
     if [ -d "$exp_name" ] && ls "${exp_name}"/checkpoint-* &>/dev/null; then
-        log "$task" "Checkpoint already exists, skipping training"
-        return 0
+        if [ "$RESUME" = true ]; then
+            log "$task" "Resuming training from latest checkpoint in ${exp_name}"
+            resume_arg="--resume"
+        else
+            log "$task" "Checkpoint already exists, skipping training (use --resume to continue)"
+            return 0
+        fi
+    elif [ "$RESUME" = true ]; then
+        log "$task" "ERROR: --resume specified but no checkpoint found in ${exp_name}"
+        return 1
     fi
 
     local logfile="${LOG_DIR}/grpo_math_train_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_math.py \\"
-        echo "    --only_grpo \\"
+        echo "    --only_grpo${resume_arg:+ ${resume_arg}} \\"
         echo "    --dataset_root ../MATH \\"
         echo "    --per_device_train_batch_size ${MATH_BS} --gradient_accumulation_steps ${MATH_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 2048 --max_completion_length 2048 \\"
@@ -234,6 +261,7 @@ train_math() {
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_math.py \
         --only_grpo \
+        ${resume_arg} \
         --dataset_root ../MATH \
         --per_device_train_batch_size ${MATH_BS} \
         --gradient_accumulation_steps ${MATH_GA} \
@@ -263,16 +291,25 @@ train_mmlu() {
     log "$task" "Experiment: ${exp_name}"
     log "$task" "Effective batch size: $((MMLU_BS * MMLU_GA)) (BS=${MMLU_BS} x GA=${MMLU_GA})"
 
+    local resume_arg=""
     if [ -d "$exp_name" ] && ls "${exp_name}"/checkpoint-* &>/dev/null; then
-        log "$task" "Checkpoint already exists, skipping training"
-        return 0
+        if [ "$RESUME" = true ]; then
+            log "$task" "Resuming training from latest checkpoint in ${exp_name}"
+            resume_arg="--resume"
+        else
+            log "$task" "Checkpoint already exists, skipping training (use --resume to continue)"
+            return 0
+        fi
+    elif [ "$RESUME" = true ]; then
+        log "$task" "ERROR: --resume specified but no checkpoint found in ${exp_name}"
+        return 1
     fi
 
     local logfile="${LOG_DIR}/grpo_mmlu_train_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_mmlu.py \\"
-        echo "    --only_grpo \\"
+        echo "    --only_grpo${resume_arg:+ ${resume_arg}} \\"
         echo "    --dataset_root ../MMLU_Train_Merged \\"
         echo "    --per_device_train_batch_size ${MMLU_BS} --gradient_accumulation_steps ${MMLU_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 1024 --max_completion_length 1024 \\"
@@ -282,6 +319,7 @@ train_mmlu() {
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_mmlu.py \
         --only_grpo \
+        ${resume_arg} \
         --dataset_root ../MMLU_Train_Merged \
         --per_device_train_batch_size ${MMLU_BS} \
         --gradient_accumulation_steps ${MMLU_GA} \
@@ -311,16 +349,25 @@ train_rag() {
     log "$task" "Experiment: ${exp_name}"
     log "$task" "Effective batch size: $((RAG_BS * RAG_GA)) (BS=${RAG_BS} x GA=${RAG_GA})"
 
+    local resume_arg=""
     if [ -d "$exp_name" ] && ls "${exp_name}"/checkpoint-* &>/dev/null; then
-        log "$task" "Checkpoint already exists, skipping training"
-        return 0
+        if [ "$RESUME" = true ]; then
+            log "$task" "Resuming training from latest checkpoint in ${exp_name}"
+            resume_arg="--resume"
+        else
+            log "$task" "Checkpoint already exists, skipping training (use --resume to continue)"
+            return 0
+        fi
+    elif [ "$RESUME" = true ]; then
+        log "$task" "ERROR: --resume specified but no checkpoint found in ${exp_name}"
+        return 1
     fi
 
     local logfile="${LOG_DIR}/grpo_rag_train_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_rag.py \\"
-        echo "    --only_grpo \\"
+        echo "    --only_grpo${resume_arg:+ ${resume_arg}} \\"
         echo "    --dataset_root ../RAG_Train_Merged \\"
         echo "    --per_device_train_batch_size ${RAG_BS} --gradient_accumulation_steps ${RAG_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 2048 --max_completion_length 1024 \\"
@@ -330,6 +377,7 @@ train_rag() {
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_rag.py \
         --only_grpo \
+        ${resume_arg} \
         --dataset_root ../RAG_Train_Merged \
         --per_device_train_batch_size ${RAG_BS} \
         --gradient_accumulation_steps ${RAG_GA} \
@@ -447,6 +495,38 @@ eval_mmlu() {
         2>&1 | tee "${logfile}"
 }
 
+eval_arcc() {
+    local task="arcc"
+    local exp_name
+    exp_name=$(get_exp_name "mmlu" 8)  # ARC-C shares checkpoint with MMLU
+    local ckpt
+    ckpt=$(find_latest_checkpoint "$exp_name")
+
+    if [ -z "$ckpt" ]; then
+        log "$task" "No checkpoint found in ${exp_name}, skipping eval"
+        return 1
+    fi
+
+    if [ -f "${ckpt}/eval_results_ai2_arc.json" ]; then
+        log "$task" "Eval results already exist at ${ckpt}/eval_results_ai2_arc.json, skipping"
+        return 0
+    fi
+
+    log "$task" "Evaluating checkpoint: ${ckpt}"
+    local logfile="${LOG_DIR}/grpo_arcc_eval_$(date +%Y%m%d_%H%M%S).log"
+
+    if [ "$DRY_RUN" = true ]; then
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_arcc.py --only_grpo --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
+        return 0
+    fi
+
+    CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_arcc.py \
+        --only_grpo \
+        --checkpoint_path "${ckpt}" \
+        --batch_size ${EVAL_BS} \
+        2>&1 | tee "${logfile}"
+}
+
 eval_rag() {
     local task="rag"
     local exp_name
@@ -475,8 +555,15 @@ eval_rag() {
         return 1
     fi
 
-    if [ -f "${ckpt}/eval_results_nq.json" ]; then
-        log "$task" "Eval results already exist at ${ckpt}/, skipping"
+    local all_rag_done=true
+    for code in nq tq 2wiki hotpotqa bamboogle; do
+        if [ ! -f "${ckpt}/eval_results_${code}.json" ]; then
+            all_rag_done=false
+            break
+        fi
+    done
+    if [ "$all_rag_done" = true ]; then
+        log "$task" "All RAG eval results already exist at ${ckpt}/, skipping"
         return 0
     fi
 
@@ -522,22 +609,67 @@ print_summary() {
         printf "  %-8s | " "$task"
         if [ -n "$ckpt" ]; then
             printf "checkpoint: %s" "$(basename "$ckpt")"
-            local eval_file
-            case "$task" in
-                gsm8k|math) eval_file="${ckpt}/eval_results.json" ;;
-                mmlu)       eval_file="${ckpt}/eval_results_mmlust.json" ;;
-                rag)        eval_file="${ckpt}/eval_results_nq.json" ;;
-            esac
-            if [ -f "$eval_file" ]; then
-                local acc
-                acc=$(python -c "
+            if [ "$task" = "rag" ]; then
+                # Show all 5 RAG benchmark accuracies
+                local rag_results=""
+                local rag_pending=false
+                for code in nq tq 2wiki hotpotqa bamboogle; do
+                    local rf="${ckpt}/eval_results_${code}.json"
+                    if [ -f "$rf" ]; then
+                        local racc
+                        racc=$(python -c "
+import json
+d = json.load(open('${rf}'))
+print(f\"{d['metrics']['accuracy']:.4f}\")
+" 2>/dev/null || echo "N/A")
+                        rag_results="${rag_results} ${code}=${racc}"
+                    else
+                        rag_pending=true
+                    fi
+                done
+                if [ -n "$rag_results" ]; then
+                    printf " |%s" "$rag_results"
+                    if [ "$rag_pending" = true ]; then
+                        printf " (partial)"
+                    fi
+                else
+                    printf " | eval: pending"
+                fi
+            else
+                local eval_file
+                case "$task" in
+                    gsm8k|math) eval_file="${ckpt}/eval_results.json" ;;
+                    mmlu)       eval_file="${ckpt}/eval_results_mmlust.json" ;;
+                esac
+                if [ -f "$eval_file" ]; then
+                    local acc
+                    acc=$(python -c "
 import json
 d = json.load(open('${eval_file}'))
 print(f\"{d['metrics']['accuracy']:.4f}\")
 " 2>/dev/null || echo "N/A")
-                printf " | accuracy: %s" "$acc"
-            else
-                printf " | eval: pending"
+                    printf " | accuracy: %s" "$acc"
+                else
+                    printf " | eval: pending"
+                fi
+            fi
+            # Show ARC-C results alongside MMLU (shared checkpoint)
+            if [ "$task" = "mmlu" ]; then
+                echo ""
+                printf "  %-8s | " "arcc"
+                printf "checkpoint: %s" "$(basename "$ckpt")"
+                local arcc_file="${ckpt}/eval_results_ai2_arc.json"
+                if [ -f "$arcc_file" ]; then
+                    local arcc_acc
+                    arcc_acc=$(python -c "
+import json
+d = json.load(open('${arcc_file}'))
+print(f\"{d['metrics']['accuracy']:.4f}\")
+" 2>/dev/null || echo "N/A")
+                    printf " | accuracy: %s" "$arcc_acc"
+                else
+                    printf " | eval: pending"
+                fi
             fi
         else
             printf "no checkpoint"
@@ -562,6 +694,7 @@ main() {
     log "MAIN" "Tasks:       ${TASKS}"
     log "MAIN" "Eval only:   ${EVAL_ONLY}"
     log "MAIN" "Skip eval:   ${SKIP_EVAL}"
+    log "MAIN" "Resume:      ${RESUME}"
     log "MAIN" "WandB:       $([ "$NO_WANDB" = true ] && echo 'disabled' || echo 'enabled')"
 
     # Parse task list
@@ -612,6 +745,14 @@ main() {
             if ! "eval_${task}"; then
                 log "MAIN" "WARNING: Evaluation ${task} failed"
                 FAILED_TASKS+=("eval_${task}")
+            fi
+            # ARC-C shares checkpoint with MMLU (paper trains on merged MMLU+ARC-C)
+            if [ "$task" = "mmlu" ]; then
+                log "MAIN" "==================== Evaluating GRPO: arcc (from mmlu checkpoint) ===================="
+                if ! eval_arcc; then
+                    log "MAIN" "WARNING: Evaluation arcc failed"
+                    FAILED_TASKS+=("eval_arcc")
+                fi
             fi
         done
     fi

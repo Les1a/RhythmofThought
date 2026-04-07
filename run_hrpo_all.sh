@@ -5,7 +5,9 @@
 # Runs HRPO (Hybrid Latent Reasoning via RL) training and evaluation for
 # GSM8K, MATH, MMLU, and RAG tasks with paper-official hyperparameters.
 #
-# Smart skipping — won't re-train if checkpoints exist, won't re-eval if results exist.
+# Smart skipping — by default won't re-train if checkpoints exist, won't re-eval if
+# results exist. Pass --resume to continue training from the latest checkpoint
+# instead of skipping (full state restore: optimizer, scheduler, RNG, global_step).
 #
 # Usage:
 #   bash run_hrpo_all.sh [OPTIONS]
@@ -17,6 +19,10 @@
 #   --paper-params        Use paper-original batch sizes instead of H200-optimized
 #   --eval-only           Skip training, only evaluate existing checkpoints
 #   --skip-eval           Skip evaluation after training
+#   --resume              Resume training from the latest checkpoint in each task's
+#                         experiment dir instead of skipping. Errors if a task's
+#                         experiment dir is missing or contains no checkpoint-*.
+#                         Hyperparameters must match the original run.
 #   --no-wandb            Disable WandB logging
 #   --prep-data           Run prepare_eval_data.py before training/eval
 #   --dry-run             Print commands without executing
@@ -63,6 +69,7 @@ SKIP_EVAL=false
 NO_WANDB=false
 PREP_DATA=false
 DRY_RUN=false
+RESUME=false
 FAILED_TASKS=()
 
 # ========================= Argument Parsing ==================================
@@ -85,6 +92,7 @@ while [[ $# -gt 0 ]]; do
             shift ;;
         --eval-only)  EVAL_ONLY=true; shift ;;
         --skip-eval)  SKIP_EVAL=true; shift ;;
+        --resume)     RESUME=true; shift ;;
         --no-wandb)   NO_WANDB=true; shift ;;
         --prep-data)  PREP_DATA=true; shift ;;
         --dry-run)    DRY_RUN=true; shift ;;
@@ -168,12 +176,27 @@ train_task() {
     log "$task" "Experiment: ${exp_name}"
     log "$task" "Effective batch size: $((bs * ga)) (BS=${bs} x GA=${ga})"
 
+    # Resolve resume vs. skip vs. fresh-train. The python script does the actual
+    # state restore; here we only decide whether to invoke it and with what flag.
+    local resume_arg=""
     if [ -d "$exp_name" ] && ls "${exp_name}"/checkpoint-* &>/dev/null; then
-        log "$task" "Checkpoint already exists, skipping training"
-        return 0
+        if [ "$RESUME" = true ]; then
+            log "$task" "Resuming training from latest checkpoint in ${exp_name}"
+            resume_arg="--resume"
+        else
+            log "$task" "Checkpoint already exists, skipping training (use --resume to continue)"
+            return 0
+        fi
     elif [ -d "$exp_name" ] && [ "$(ls -A "$exp_name" 2>/dev/null)" ]; then
+        if [ "$RESUME" = true ]; then
+            log "$task" "ERROR: --resume specified but no checkpoint-* found in ${exp_name}"
+            return 1
+        fi
         log "$task" "WARNING: Stale experiment dir (no checkpoint). Cleaning ${exp_name}..."
         rm -rf "$exp_name"
+    elif [ "$RESUME" = true ]; then
+        log "$task" "ERROR: --resume specified but ${exp_name} does not exist"
+        return 1
     fi
 
     local logfile="${LOG_DIR}/${task}_train_$(date +%Y%m%d_%H%M%S).log"
@@ -184,12 +207,13 @@ train_task() {
         [ -n "$dataset_root" ] && echo "    --dataset_root ${dataset_root} \\"
         echo "    --per_device_train_batch_size ${bs} --gradient_accumulation_steps ${ga} \\"
         echo "    --group_size ${group_size} --max_prompt_length ${max_prompt} --max_completion_length ${max_completion} \\"
-        echo "    --model_name ${MODEL} --lora_rank ${LORA_RANK} --lr ${LR} --beta ${BETA} --temperature ${TEMPERATURE} --seed ${SEED}"
+        echo "    --model_name ${MODEL} --lora_rank ${LORA_RANK} --lr ${LR} --beta ${BETA} --temperature ${TEMPERATURE} --seed ${SEED}${resume_arg:+ ${resume_arg}}"
         return 0
     fi
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python "$script" \
         ${dataset_root:+--dataset_root "$dataset_root"} \
+        ${resume_arg} \
         --per_device_train_batch_size ${bs} \
         --gradient_accumulation_steps ${ga} \
         --group_size ${group_size} \
@@ -509,6 +533,7 @@ main() {
     log "MAIN" "Tasks:       ${TASKS}"
     log "MAIN" "Eval only:   ${EVAL_ONLY}"
     log "MAIN" "Skip eval:   ${SKIP_EVAL}"
+    log "MAIN" "Resume:      ${RESUME}"
     log "MAIN" "WandB:       $([ "$NO_WANDB" = true ] && echo 'disabled' || echo 'enabled')"
 
     # Parse task list

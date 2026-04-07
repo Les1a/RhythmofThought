@@ -7,6 +7,7 @@ import os
 import json
 import argparse
 from trl import GRPOConfig, GRPOTrainer
+from transformers.trainer_utils import get_last_checkpoint
 from datasets import load_dataset, Dataset
 from patch import patch_trainer_optimizer
 from utils import *
@@ -32,7 +33,17 @@ def main(args):
     else:
         exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-mmlu-group{args.group_size}"
                     f"-lora{args.lora_rank}-rmin{args.residual_r_min}-temp{args.temperature}")
-    if os.path.exists(exp_name) and len(os.listdir(exp_name)) > 0:
+    resume_from_checkpoint = None
+    if args.resume:
+        if not os.path.exists(exp_name):
+            print(f"--resume specified but {exp_name} does not exist. Exiting...")
+            exit()
+        resume_from_checkpoint = get_last_checkpoint(exp_name)
+        if resume_from_checkpoint is None:
+            print(f"--resume specified but no checkpoint-* dirs found in {exp_name}. Exiting...")
+            exit()
+        print(f"Resuming from {resume_from_checkpoint}")
+    elif os.path.exists(exp_name) and len(os.listdir(exp_name)) > 0:
         print(f"Experiment {exp_name} already exists. Exiting...")
         exit()
 
@@ -114,7 +125,7 @@ def main(args):
             args.lr_residual_gate,
             args.lr_residual_Lambda,
         )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
 
 if __name__ == "__main__":
@@ -144,6 +155,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--only_grpo", action="store_true", default=False)
+    parser.add_argument("--resume", action="store_true", default=False)
     args = parser.parse_args()
 
     # "Qwen/Qwen2.5-1.5B-Instruct"
