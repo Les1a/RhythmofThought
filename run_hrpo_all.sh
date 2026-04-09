@@ -24,7 +24,7 @@
 #                         experiment dir is missing or contains no checkpoint-*.
 #                         Hyperparameters must match the original run.
 #   --no-wandb            Disable WandB logging
-#   --prep-data           Run prepare_eval_data.py before training/eval
+#   --prep-data           Run prepare_data.py for selected --tasks before training/eval
 #   --dry-run             Print commands without executing
 #   --help                Show this help message
 ###############################################################################
@@ -557,22 +557,31 @@ main() {
         log "MAIN" "WandB disabled"
     fi
 
-    # Prepare eval data if requested or if RAG_Eval is missing
+    # Prepare datasets if requested or if RAG_Eval is missing
     if [ "$PREP_DATA" = true ]; then
-        log "MAIN" "Preparing evaluation datasets..."
-        python prepare_eval_data.py --download-math
+        local task_arg
+        task_arg=$(IFS=,; echo "${TASK_LIST[*]}")
+        local stage_arg="all"
+        [ "$EVAL_ONLY" = true ] && stage_arg="eval"
+        [ "$SKIP_EVAL" = true ] && stage_arg="train"
+        log "MAIN" "Preparing datasets for tasks=${task_arg} stage=${stage_arg}"
+        if [ "$DRY_RUN" = true ]; then
+            log "MAIN" "[DRY-RUN] python prepare_data.py --tasks ${task_arg} --stage ${stage_arg} --with-retrieval"
+        else
+            python prepare_data.py --tasks "$task_arg" --stage "$stage_arg" --with-retrieval
+        fi
     elif [ "$SKIP_EVAL" != true ]; then
-        # Auto-check: if rag is in task list and RAG_Eval doesn't exist, warn user
+        # Auto-check: if rag is in task list and RAG_Eval doesn't exist, warn user + auto-prep
         for task in "${TASK_LIST[@]}"; do
             if [ "$task" = "rag" ] && [ ! -d "../RAG_Eval/NQ_Eval" ]; then
                 log "MAIN" "WARNING: RAG eval datasets missing at ../RAG_Eval/"
-                log "MAIN" "Run: python prepare_eval_data.py --with-retrieval"
-                log "MAIN" "Without --with-retrieval, NQ/TQ/Bamboogle will have empty contexts (closed-book)"
-                log "MAIN" "Preparing with --with-retrieval (requires: pip install rank_bm25)..."
-                python prepare_eval_data.py --with-retrieval || {
-                    log "MAIN" "Retrieval prep failed. Falling back to closed-book (no contexts)..."
-                    python prepare_eval_data.py
-                }
+                log "MAIN" "Auto-preparing via prepare_data.py --tasks rag --stage eval --with-retrieval"
+                log "MAIN" "(NQ/TQ/Bamboogle will be closed-book if rank_bm25 is not installed)"
+                if [ "$DRY_RUN" = true ]; then
+                    log "MAIN" "[DRY-RUN] python prepare_data.py --tasks rag --stage eval --with-retrieval"
+                else
+                    python prepare_data.py --tasks rag --stage eval --with-retrieval
+                fi
                 break
             fi
         done

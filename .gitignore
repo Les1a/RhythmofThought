@@ -1,6 +1,9 @@
 hrpo-paper/
 .claude/
 logs/
+findings.md
+progress.md
+task_plan.md
 
 *.pyc
 *.p

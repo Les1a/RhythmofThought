@@ -25,6 +25,7 @@
 #                         experiment dir is missing or contains no checkpoint-*.
 #                         Hyperparameters must match the original run.
 #   --no-wandb            Disable WandB logging
+#   --prep-data           Run prepare_data.py for selected --tasks before training/eval
 #   --dry-run             Print commands without executing
 #   --help                Show this help message
 ###############################################################################
@@ -61,13 +62,14 @@ TASKS="all"
 EVAL_ONLY=false
 SKIP_EVAL=false
 NO_WANDB=false
+PREP_DATA=false
 DRY_RUN=false
 RESUME=false
 FAILED_TASKS=()
 
 # ========================= Argument Parsing ==================================
 show_help() {
-    head -25 "$0" | tail -23 | sed 's/^# \?//'
+    sed -n '/^# Usage:/,/^###/{ /^###/d; s/^# \?//; p }' "$0"
     exit 0
 }
 
@@ -87,6 +89,7 @@ while [[ $# -gt 0 ]]; do
         --skip-eval)  SKIP_EVAL=true; shift ;;
         --resume)     RESUME=true; shift ;;
         --no-wandb)   NO_WANDB=true; shift ;;
+        --prep-data)  PREP_DATA=true; shift ;;
         --dry-run)    DRY_RUN=true; shift ;;
         --help|-h)    show_help ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -716,6 +719,36 @@ main() {
     if [ "$NO_WANDB" = true ]; then
         export WANDB_DISABLED=true
         log "MAIN" "WandB disabled"
+    fi
+
+    # Prepare datasets if requested or if RAG_Eval is missing
+    if [ "$PREP_DATA" = true ]; then
+        local task_arg
+        task_arg=$(IFS=,; echo "${TASK_LIST[*]}")
+        local stage_arg="all"
+        [ "$EVAL_ONLY" = true ] && stage_arg="eval"
+        [ "$SKIP_EVAL" = true ] && stage_arg="train"
+        log "MAIN" "Preparing datasets for tasks=${task_arg} stage=${stage_arg}"
+        if [ "$DRY_RUN" = true ]; then
+            log "MAIN" "[DRY-RUN] python prepare_data.py --tasks ${task_arg} --stage ${stage_arg} --with-retrieval"
+        else
+            python prepare_data.py --tasks "$task_arg" --stage "$stage_arg" --with-retrieval
+        fi
+    elif [ "$SKIP_EVAL" != true ]; then
+        # Auto-check: if rag is in task list and RAG_Eval doesn't exist, warn user + auto-prep
+        for task in "${TASK_LIST[@]}"; do
+            if [ "$task" = "rag" ] && [ ! -d "../RAG_Eval/NQ_Eval" ]; then
+                log "MAIN" "WARNING: RAG eval datasets missing at ../RAG_Eval/"
+                log "MAIN" "Auto-preparing via prepare_data.py --tasks rag --stage eval --with-retrieval"
+                log "MAIN" "(NQ/TQ/Bamboogle will be closed-book if rank_bm25 is not installed)"
+                if [ "$DRY_RUN" = true ]; then
+                    log "MAIN" "[DRY-RUN] python prepare_data.py --tasks rag --stage eval --with-retrieval"
+                else
+                    python prepare_data.py --tasks rag --stage eval --with-retrieval
+                fi
+                break
+            fi
+        done
     fi
 
     # Validate datasets
