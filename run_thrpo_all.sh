@@ -36,10 +36,6 @@
 ###############################################################################
 set -eo pipefail
 
-# Prevent CUDA VMM (expandable_segments) from mapping ~2x GPU memory as shmem,
-# which causes cgroup OOM on nodes with strict memory limits (e.g., 256GB for H200).
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:+${PYTORCH_CUDA_ALLOC_CONF},}expandable_segments:False"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="$SCRIPT_DIR"
 LOG_DIR="${WORK_DIR}/logs"
