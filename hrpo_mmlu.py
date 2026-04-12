@@ -151,7 +151,6 @@ def main(args):
     )
     if is_tgrpo or is_thrpo:
         trainer.time_loss_weight = args.time_loss_weight
-        trainer.time_aux_weight_floor = args.time_aux_weight_floor
     if not is_grpo:
         patch_trainer_optimizer(
             trainer,
@@ -190,7 +189,6 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--time_conditioning", action="store_true", default=False)
     parser.add_argument("--time_loss_weight", type=float, default=0.1)
-    parser.add_argument("--time_aux_weight_floor", type=float, default=0.25)
     parser.add_argument("--lr_time_conditioning", type=float, default=1e-4)
     parser.add_argument("--only_grpo", action="store_true", default=False)
     parser.add_argument("--tgrpo", action="store_true", default=False)

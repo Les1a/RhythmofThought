@@ -207,24 +207,6 @@ def select_training_time_embedding(
     return time_emb, mix_alpha, effective_rollout_alpha
 
 
-def compute_time_aux_weights(rewards, floor=0.25):
-    """Convert rewards into dense auxiliary-loss weights."""
-    if rewards is None:
-        return None
-    if not torch.isfinite(rewards).all():
-        raise ValueError("rewards contains non-finite values")
-    floor = float(floor)
-    if floor < 0.0 or floor > 1.0:
-        raise ValueError(f"time_aux_weight_floor must be in [0, 1], got {floor}")
-    rewards = rewards.float()
-    r_min = rewards.min()
-    r_max = rewards.max()
-    if torch.isclose(r_max, r_min):
-        return torch.ones_like(rewards)
-    r_norm = (rewards - r_min) / (r_max - r_min)
-    return floor + (1.0 - floor) * r_norm
-
-
 def get_time_conditioning_base_model(model):
     """Resolve the inner model that owns time-conditioning state."""
     if hasattr(model, "base_model") and hasattr(model.base_model, "model") and hasattr(model.base_model.model, "model"):

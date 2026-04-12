@@ -542,14 +542,13 @@ def grpo_trainer_compute_loss(function_name, function):
         if _time_loss_w > 0 and _base is not None and _gt_time_vals is not None:
             _time_pred = getattr(_base, '_last_time_pred', None)
             if _time_pred is not None:
-                from time_conditioning import compute_time_aux_weights, dead_zone_mse
+                from time_conditioning import dead_zone_mse
                 _tm = thinking_mask.float()
                 _dz = dead_zone_mse(_time_pred, _gt_time_vals)
                 _per_sample = (_dz * _tm).sum(1) / _tm.sum(1).clamp(min=1)
                 _rewards = inputs.get("rewards")
-                _aux_weight_floor = getattr(self, "time_aux_weight_floor", 0.25)
                 if _rewards is not None:
-                    _aux_weights = compute_time_aux_weights(_rewards, floor=_aux_weight_floor)
+                    _aux_weights = _rewards
                 else:
                     _aux_weights = torch.ones_like(_per_sample)
                 _aux_weights = _aux_weights.to(device=_per_sample.device, dtype=_per_sample.dtype)
