@@ -24,6 +24,9 @@
 #                         experiment dir instead of skipping. Errors if a task's
 #                         experiment dir is missing or contains no checkpoint-*.
 #                         Hyperparameters must match the original run.
+#   --time-cond           Run TGRPO (GRPO + time conditioning, no thinking residual)
+#   --time-loss-weight V  Time conditioning loss weight (default: 0.1)
+#   --lr-time-cond V      Learning rate for time conditioning modules (default: 1e-4)
 #   --no-wandb            Disable WandB logging
 #   --prep-data           Run prepare_data.py for selected --tasks before training/eval
 #   --dry-run             Print commands without executing
@@ -65,6 +68,13 @@ NO_WANDB=false
 PREP_DATA=false
 DRY_RUN=false
 RESUME=false
+TIME_CONDITIONING=false
+TIME_LOSS_WEIGHT=0.1
+LR_TIME_CONDITIONING=1e-4
+MODE_LABEL="GRPO"
+MODE_LOG_PREFIX="grpo"
+TRAIN_MODE_FLAG="--only_grpo"
+EVAL_MODE_FLAG="--only_grpo"
 FAILED_TASKS=()
 
 # ========================= Argument Parsing ==================================
@@ -88,6 +98,15 @@ while [[ $# -gt 0 ]]; do
         --eval-only)  EVAL_ONLY=true; shift ;;
         --skip-eval)  SKIP_EVAL=true; shift ;;
         --resume)     RESUME=true; shift ;;
+        --time-cond)
+            TIME_CONDITIONING=true
+            MODE_LABEL="TGRPO"
+            MODE_LOG_PREFIX="tgrpo"
+            TRAIN_MODE_FLAG="--tgrpo"
+            EVAL_MODE_FLAG="--tgrpo"
+            shift ;;
+        --time-loss-weight) TIME_LOSS_WEIGHT="$2"; shift 2 ;;
+        --lr-time-cond)     LR_TIME_CONDITIONING="$2"; shift 2 ;;
         --no-wandb)   NO_WANDB=true; shift ;;
         --prep-data)  PREP_DATA=true; shift ;;
         --dry-run)    DRY_RUN=true; shift ;;
@@ -106,12 +125,27 @@ get_exp_name() {
     local task="$1"
     local group_size="$2"
     local model_short="${MODEL##*/}"
-    echo "./experiments/${model_short}-${task}-grpo-group${group_size}-lora${LORA_RANK}-temp${TEMPERATURE}"
+    if [ "$TIME_CONDITIONING" = true ]; then
+        echo "./experiments/${model_short}-${task}-tgrpo-group${group_size}-lora${LORA_RANK}-temp${TEMPERATURE}-tcond"
+    else
+        echo "./experiments/${model_short}-${task}-grpo-group${group_size}-lora${LORA_RANK}-temp${TEMPERATURE}"
+    fi
 }
 
 find_latest_checkpoint() {
     local exp_dir="$1"
     ls -d "${exp_dir}"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1
+}
+
+dry_run_checkpoint_hint() {
+    local exp_dir="$1"
+    local ckpt
+    ckpt=$(find_latest_checkpoint "$exp_dir")
+    if [ -n "$ckpt" ]; then
+        echo "$ckpt"
+    else
+        echo "${exp_dir}/checkpoint-<latest>"
+    fi
 }
 
 check_dataset() {
@@ -137,7 +171,7 @@ check_dataset() {
     return 0
 }
 
-# Common training args shared by all tasks (GRPO baseline: no residual args)
+# Common training args shared by all tasks (GRPO or TGRPO: no residual args)
 common_train_args() {
     echo "--model_name ${MODEL} \
         --lora_rank ${LORA_RANK} \
@@ -149,7 +183,8 @@ common_train_args() {
         --optimizer ${OPTIMIZER} \
         --max_grad_norm ${MAX_GRAD_NORM} \
         --temperature ${TEMPERATURE} \
-        --seed ${SEED}"
+        --seed ${SEED} \
+        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" )"
 }
 
 # ========================= Conda Activation ==================================
@@ -194,11 +229,11 @@ train_gsm8k() {
         return 1
     fi
 
-    local logfile="${LOG_DIR}/grpo_gsm8k_train_$(date +%Y%m%d_%H%M%S).log"
+    local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_gsm8k_train_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_gsm8k.py \\"
-        echo "    --only_grpo${resume_arg:+ ${resume_arg}} \\"
+        echo "    ${TRAIN_MODE_FLAG}${resume_arg:+ ${resume_arg}} \\"
         echo "    --per_device_train_batch_size ${GSM8K_BS} --gradient_accumulation_steps ${GSM8K_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 1024 --max_completion_length 1024 \\"
         echo "    $(common_train_args)"
@@ -206,7 +241,7 @@ train_gsm8k() {
     fi
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_gsm8k.py \
-        --only_grpo \
+        ${TRAIN_MODE_FLAG} \
         ${resume_arg} \
         --per_device_train_batch_size ${GSM8K_BS} \
         --gradient_accumulation_steps ${GSM8K_GA} \
@@ -224,6 +259,7 @@ train_gsm8k() {
         --max_grad_norm ${MAX_GRAD_NORM} \
         --temperature ${TEMPERATURE} \
         --seed ${SEED} \
+        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" ) \
         2>&1 | tee "${logfile}"
 }
 
@@ -250,11 +286,11 @@ train_math() {
         return 1
     fi
 
-    local logfile="${LOG_DIR}/grpo_math_train_$(date +%Y%m%d_%H%M%S).log"
+    local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_math_train_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_math.py \\"
-        echo "    --only_grpo${resume_arg:+ ${resume_arg}} \\"
+        echo "    ${TRAIN_MODE_FLAG}${resume_arg:+ ${resume_arg}} \\"
         echo "    --dataset_root ../MATH \\"
         echo "    --per_device_train_batch_size ${MATH_BS} --gradient_accumulation_steps ${MATH_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 2048 --max_completion_length 2048 \\"
@@ -263,7 +299,7 @@ train_math() {
     fi
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_math.py \
-        --only_grpo \
+        ${TRAIN_MODE_FLAG} \
         ${resume_arg} \
         --dataset_root ../MATH \
         --per_device_train_batch_size ${MATH_BS} \
@@ -282,6 +318,7 @@ train_math() {
         --max_grad_norm ${MAX_GRAD_NORM} \
         --temperature ${TEMPERATURE} \
         --seed ${SEED} \
+        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" ) \
         2>&1 | tee "${logfile}"
 }
 
@@ -308,11 +345,11 @@ train_mmlu() {
         return 1
     fi
 
-    local logfile="${LOG_DIR}/grpo_mmlu_train_$(date +%Y%m%d_%H%M%S).log"
+    local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_mmlu_train_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_mmlu.py \\"
-        echo "    --only_grpo${resume_arg:+ ${resume_arg}} \\"
+        echo "    ${TRAIN_MODE_FLAG}${resume_arg:+ ${resume_arg}} \\"
         echo "    --dataset_root ../MMLU_Train_Merged \\"
         echo "    --per_device_train_batch_size ${MMLU_BS} --gradient_accumulation_steps ${MMLU_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 1024 --max_completion_length 1024 \\"
@@ -321,7 +358,7 @@ train_mmlu() {
     fi
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_mmlu.py \
-        --only_grpo \
+        ${TRAIN_MODE_FLAG} \
         ${resume_arg} \
         --dataset_root ../MMLU_Train_Merged \
         --per_device_train_batch_size ${MMLU_BS} \
@@ -340,6 +377,7 @@ train_mmlu() {
         --max_grad_norm ${MAX_GRAD_NORM} \
         --temperature ${TEMPERATURE} \
         --seed ${SEED} \
+        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" ) \
         2>&1 | tee "${logfile}"
 }
 
@@ -366,11 +404,11 @@ train_rag() {
         return 1
     fi
 
-    local logfile="${LOG_DIR}/grpo_rag_train_$(date +%Y%m%d_%H%M%S).log"
+    local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_rag_train_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_rag.py \\"
-        echo "    --only_grpo${resume_arg:+ ${resume_arg}} \\"
+        echo "    ${TRAIN_MODE_FLAG}${resume_arg:+ ${resume_arg}} \\"
         echo "    --dataset_root ../RAG_Train_Merged \\"
         echo "    --per_device_train_batch_size ${RAG_BS} --gradient_accumulation_steps ${RAG_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 2048 --max_completion_length 1024 \\"
@@ -379,7 +417,7 @@ train_rag() {
     fi
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_rag.py \
-        --only_grpo \
+        ${TRAIN_MODE_FLAG} \
         ${resume_arg} \
         --dataset_root ../RAG_Train_Merged \
         --per_device_train_batch_size ${RAG_BS} \
@@ -398,6 +436,7 @@ train_rag() {
         --max_grad_norm ${MAX_GRAD_NORM} \
         --temperature ${TEMPERATURE} \
         --seed ${SEED} \
+        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" ) \
         2>&1 | tee "${logfile}"
 }
 
@@ -406,6 +445,12 @@ eval_gsm8k() {
     local task="gsm8k"
     local exp_name
     exp_name=$(get_exp_name "$task" 4)
+    if [ "$DRY_RUN" = true ]; then
+        local ckpt_hint
+        ckpt_hint=$(dry_run_checkpoint_hint "$exp_name")
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_gsm8k.py ${EVAL_MODE_FLAG} --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
+        return 0
+    fi
     local ckpt
     ckpt=$(find_latest_checkpoint "$exp_name")
 
@@ -420,15 +465,10 @@ eval_gsm8k() {
     fi
 
     log "$task" "Evaluating checkpoint: ${ckpt}"
-    local logfile="${LOG_DIR}/grpo_gsm8k_eval_$(date +%Y%m%d_%H%M%S).log"
-
-    if [ "$DRY_RUN" = true ]; then
-        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_gsm8k.py --only_grpo --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
-        return 0
-    fi
+    local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_gsm8k_eval_$(date +%Y%m%d_%H%M%S).log"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_gsm8k.py \
-        --only_grpo \
+        ${EVAL_MODE_FLAG} \
         --checkpoint_path "${ckpt}" \
         --batch_size ${EVAL_BS} \
         2>&1 | tee "${logfile}"
@@ -438,6 +478,12 @@ eval_math() {
     local task="math"
     local exp_name
     exp_name=$(get_exp_name "$task" 8)
+    if [ "$DRY_RUN" = true ]; then
+        local ckpt_hint
+        ckpt_hint=$(dry_run_checkpoint_hint "$exp_name")
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_math.py ${EVAL_MODE_FLAG} --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
+        return 0
+    fi
     local ckpt
     ckpt=$(find_latest_checkpoint "$exp_name")
 
@@ -452,15 +498,10 @@ eval_math() {
     fi
 
     log "$task" "Evaluating checkpoint: ${ckpt}"
-    local logfile="${LOG_DIR}/grpo_math_eval_$(date +%Y%m%d_%H%M%S).log"
-
-    if [ "$DRY_RUN" = true ]; then
-        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_math.py --only_grpo --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
-        return 0
-    fi
+    local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_math_eval_$(date +%Y%m%d_%H%M%S).log"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_math.py \
-        --only_grpo \
+        ${EVAL_MODE_FLAG} \
         --checkpoint_path "${ckpt}" \
         --batch_size ${EVAL_BS} \
         2>&1 | tee "${logfile}"
@@ -470,6 +511,12 @@ eval_mmlu() {
     local task="mmlu"
     local exp_name
     exp_name=$(get_exp_name "$task" 8)
+    if [ "$DRY_RUN" = true ]; then
+        local ckpt_hint
+        ckpt_hint=$(dry_run_checkpoint_hint "$exp_name")
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_mmlust.py ${EVAL_MODE_FLAG} --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
+        return 0
+    fi
     local ckpt
     ckpt=$(find_latest_checkpoint "$exp_name")
 
@@ -484,15 +531,10 @@ eval_mmlu() {
     fi
 
     log "$task" "Evaluating checkpoint: ${ckpt}"
-    local logfile="${LOG_DIR}/grpo_mmlu_eval_$(date +%Y%m%d_%H%M%S).log"
-
-    if [ "$DRY_RUN" = true ]; then
-        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_mmlust.py --only_grpo --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
-        return 0
-    fi
+    local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_mmlu_eval_$(date +%Y%m%d_%H%M%S).log"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_mmlust.py \
-        --only_grpo \
+        ${EVAL_MODE_FLAG} \
         --checkpoint_path "${ckpt}" \
         --batch_size ${EVAL_BS} \
         2>&1 | tee "${logfile}"
@@ -502,6 +544,12 @@ eval_arcc() {
     local task="arcc"
     local exp_name
     exp_name=$(get_exp_name "mmlu" 8)  # ARC-C shares checkpoint with MMLU
+    if [ "$DRY_RUN" = true ]; then
+        local ckpt_hint
+        ckpt_hint=$(dry_run_checkpoint_hint "$exp_name")
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_arcc.py ${EVAL_MODE_FLAG} --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
+        return 0
+    fi
     local ckpt
     ckpt=$(find_latest_checkpoint "$exp_name")
 
@@ -516,15 +564,10 @@ eval_arcc() {
     fi
 
     log "$task" "Evaluating checkpoint: ${ckpt}"
-    local logfile="${LOG_DIR}/grpo_arcc_eval_$(date +%Y%m%d_%H%M%S).log"
-
-    if [ "$DRY_RUN" = true ]; then
-        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_arcc.py --only_grpo --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
-        return 0
-    fi
+    local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_arcc_eval_$(date +%Y%m%d_%H%M%S).log"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_arcc.py \
-        --only_grpo \
+        ${EVAL_MODE_FLAG} \
         --checkpoint_path "${ckpt}" \
         --batch_size ${EVAL_BS} \
         2>&1 | tee "${logfile}"
@@ -534,6 +577,12 @@ eval_rag() {
     local task="rag"
     local exp_name
     exp_name=$(get_exp_name "$task" 4)
+    if [ "$DRY_RUN" = true ]; then
+        local ckpt_hint
+        ckpt_hint=$(dry_run_checkpoint_hint "$exp_name")
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_rag.py ${EVAL_MODE_FLAG} --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
+        return 0
+    fi
     local ckpt
     ckpt=$(find_latest_checkpoint "$exp_name")
 
@@ -571,15 +620,10 @@ eval_rag() {
     fi
 
     log "$task" "Evaluating checkpoint: ${ckpt}"
-    local logfile="${LOG_DIR}/grpo_rag_eval_$(date +%Y%m%d_%H%M%S).log"
-
-    if [ "$DRY_RUN" = true ]; then
-        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_rag.py --only_grpo --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
-        return 0
-    fi
+    local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_rag_eval_$(date +%Y%m%d_%H%M%S).log"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_rag.py \
-        --only_grpo \
+        ${EVAL_MODE_FLAG} \
         --checkpoint_path "${ckpt}" \
         --batch_size ${EVAL_BS} \
         2>&1 | tee "${logfile}"
@@ -589,11 +633,18 @@ eval_rag() {
 print_summary() {
     echo ""
     echo "============================================================"
-    echo "              GRPO Baseline Pipeline Summary"
+    if [ "$TIME_CONDITIONING" = true ]; then
+        echo "                    TGRPO Pipeline Summary"
+    else
+        echo "              GRPO Baseline Pipeline Summary"
+    fi
     echo "============================================================"
     echo "Model:  ${MODEL}"
     echo "GPU:    ${GPU_ID}"
     echo "Tasks:  ${TASKS}"
+    if [ "$TIME_CONDITIONING" = true ]; then
+        echo "Time conditioning: weight=${TIME_LOSS_WEIGHT}, lr=${LR_TIME_CONDITIONING}"
+    fi
     echo ""
 
     for task in "${TASK_LIST[@]}"; do
@@ -690,7 +741,11 @@ print(f\"{d['metrics']['accuracy']:.4f}\")
 # ========================= Main ==============================================
 main() {
     log "MAIN" "=========================================="
-    log "MAIN" "GRPO Baseline Training & Evaluation"
+    if [ "$TIME_CONDITIONING" = true ]; then
+        log "MAIN" "TGRPO Training & Evaluation"
+    else
+        log "MAIN" "GRPO Baseline Training & Evaluation"
+    fi
     log "MAIN" "=========================================="
     log "MAIN" "Model:       ${MODEL}"
     log "MAIN" "GPU:         ${GPU_ID}"
@@ -698,6 +753,7 @@ main() {
     log "MAIN" "Eval only:   ${EVAL_ONLY}"
     log "MAIN" "Skip eval:   ${SKIP_EVAL}"
     log "MAIN" "Resume:      ${RESUME}"
+    log "MAIN" "Mode:        ${MODE_LABEL}"
     log "MAIN" "WandB:       $([ "$NO_WANDB" = true ] && echo 'disabled' || echo 'enabled')"
 
     # Parse task list
@@ -763,7 +819,7 @@ main() {
     # Training phase
     if [ "$EVAL_ONLY" != true ]; then
         for task in "${TASK_LIST[@]}"; do
-            log "MAIN" "==================== Training GRPO: ${task} ===================="
+            log "MAIN" "==================== Training ${MODE_LABEL}: ${task} ===================="
             if ! "train_${task}"; then
                 log "MAIN" "WARNING: Training ${task} failed"
                 FAILED_TASKS+=("train_${task}")
@@ -774,14 +830,14 @@ main() {
     # Evaluation phase
     if [ "$SKIP_EVAL" != true ]; then
         for task in "${TASK_LIST[@]}"; do
-            log "MAIN" "==================== Evaluating GRPO: ${task} ===================="
+            log "MAIN" "==================== Evaluating ${MODE_LABEL}: ${task} ===================="
             if ! "eval_${task}"; then
                 log "MAIN" "WARNING: Evaluation ${task} failed"
                 FAILED_TASKS+=("eval_${task}")
             fi
             # ARC-C shares checkpoint with MMLU (paper trains on merged MMLU+ARC-C)
             if [ "$task" = "mmlu" ]; then
-                log "MAIN" "==================== Evaluating GRPO: arcc (from mmlu checkpoint) ===================="
+                log "MAIN" "==================== Evaluating ${MODE_LABEL}: arcc (from mmlu checkpoint) ===================="
                 if ! eval_arcc; then
                     log "MAIN" "WARNING: Evaluation arcc failed"
                     FAILED_TASKS+=("eval_arcc")

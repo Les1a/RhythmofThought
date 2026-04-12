@@ -117,7 +117,9 @@ get_exp_name() {
     local task="$1"
     local group_size="$2"
     local model_short="${MODEL##*/}"
-    local name="./experiments/${model_short}-${task}-group${group_size}-lora${LORA_RANK}-rmin${RESIDUAL_R_MIN}-temp${TEMPERATURE}"
+    local mode="hrpo"
+    [ "$TIME_CONDITIONING" = true ] && mode="thrpo"
+    local name="./experiments/${model_short}-${task}-${mode}-group${group_size}-lora${LORA_RANK}-rmin${RESIDUAL_R_MIN}-temp${TEMPERATURE}"
     [ "$TIME_CONDITIONING" = true ] && name="${name}-tcond"
     echo "$name"
 }

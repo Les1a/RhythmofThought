@@ -699,7 +699,7 @@ def LlamaModel_fast_forward(
         inputs_embeds = self.embed_tokens(input_ids)
 
     thinking_mask = kwargs.get('thinking_mask')
-    if thinking_mask is not None:
+    if thinking_mask is not None and not getattr(self, "disable_thinking_residual", False):
         new_inputs_embeds = inputs_embeds.clone()
         new_inputs_embeds[thinking_mask] = self.thinking_residual(
             inputs_embeds[thinking_mask], thinking_embeds[thinking_mask],
@@ -1042,12 +1042,13 @@ def LlamaModel_fast_forward_inference(
     embeds_ratio = torch.ones(X.shape[0], dtype=X.dtype, device=X.device)
     if is_thinking is not None and last_thinking_states is not None:
         thinking_embeds = last_thinking_states
-        X_hat, a_t = self.model.thinking_residual(
-            X, last_thinking_states.unsqueeze(1),
-        )
-        embeds_ratio = a_t.mean(-1).flatten()
-        embeds_ratio[~torch.tensor(is_thinking)] = 1.
-        X[is_thinking] = X_hat[is_thinking].to(X.dtype)
+        if not getattr(self.model, "disable_thinking_residual", False):
+            X_hat, a_t = self.model.thinking_residual(
+                X, last_thinking_states.unsqueeze(1),
+            )
+            embeds_ratio = a_t.mean(-1).flatten()
+            embeds_ratio[~torch.tensor(is_thinking)] = 1.
+            X[is_thinking] = X_hat[is_thinking].to(X.dtype)
 
     # Gate time conditioning by is_thinking during decode
     _tc_mask_inf = None

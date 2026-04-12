@@ -34,6 +34,7 @@ def create_eval_parser():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--checkpoint_path", type=str, default=None)
     parser.add_argument("--only_grpo", action="store_true", default=False)
+    parser.add_argument("--tgrpo", action="store_true", default=False)
     return parser
 
 SYSTEM_PROMPT = (

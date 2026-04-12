@@ -22,7 +22,10 @@ def evaluate_model(
     num_samples: int = None,
     save_results: bool = True,
     only_grpo: bool = False,
+    tgrpo: bool = False,
 ):
+    if only_grpo and tgrpo:
+        raise ValueError("--only_grpo and --tgrpo are mutually exclusive")
     def get_prompt(question, choices):
         prompt = f"Question: {question}\nOptions:\n"
         for i, choice in enumerate(choices):
@@ -37,6 +40,9 @@ def evaluate_model(
     )
     if not only_grpo:
         model.answer_start = ANSWER_START
+    if tgrpo:
+        model.disable_thinking_residual = True
+        model.model.disable_thinking_residual = True
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -187,4 +193,5 @@ if __name__ == "__main__":
             num_samples=None,
             save_results=True,
             only_grpo=args.only_grpo,
+            tgrpo=args.tgrpo,
         )

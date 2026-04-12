@@ -2,7 +2,12 @@ import types
 from transformers.trainer import *
 
 
-def patch_trainer_optimizer(trainer, lr_thinking_residual_gate=1e-4, thinking_residual_Lambda=1e-3, lr_time_conditioning=None):
+def patch_trainer_optimizer(
+    trainer,
+    lr_thinking_residual_gate=1e-4,
+    thinking_residual_Lambda=1e-3,
+    lr_time_conditioning=None,
+):
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -32,21 +37,28 @@ def patch_trainer_optimizer(trainer, lr_thinking_residual_gate=1e-4, thinking_re
                     "lr": self.args.learning_rate,
                     "weight_decay": 0.0,
                 },
-                {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if ("thinking_residual_gate" in n and p.requires_grad)
-                    ],
-                    "lr": lr_thinking_residual_gate,
-                    "weight_decay": self.args.weight_decay,
-                },
-                {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if ("thinking_residual_Lambda" in n and p.requires_grad)
-                    ],
-                    "lr": thinking_residual_Lambda,
-                    "weight_decay": self.args.weight_decay,
-                },
             ]
+
+            if lr_thinking_residual_gate is not None:
+                optimizer_grouped_parameters.append(
+                    {
+                        "params": [
+                            p for n, p in opt_model.named_parameters() if ("thinking_residual_gate" in n and p.requires_grad)
+                        ],
+                        "lr": lr_thinking_residual_gate,
+                        "weight_decay": self.args.weight_decay,
+                    }
+                )
+            if thinking_residual_Lambda is not None:
+                optimizer_grouped_parameters.append(
+                    {
+                        "params": [
+                            p for n, p in opt_model.named_parameters() if ("thinking_residual_Lambda" in n and p.requires_grad)
+                        ],
+                        "lr": thinking_residual_Lambda,
+                        "weight_decay": self.args.weight_decay,
+                    }
+                )
 
             if lr_time_conditioning is not None:
                 _tc_names = ("sinusoidal_time_embedding", "adaln_proj", "time_progress_predictor")

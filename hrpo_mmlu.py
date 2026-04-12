@@ -27,13 +27,28 @@ def preprocess_mmlu(chunk_size=1000, root='../MMLU_Train_Merged') -> Dataset:
 
 
 def main(args):
-    if args.only_grpo:
+    if args.only_grpo and args.tgrpo:
+        raise ValueError("--only_grpo and --tgrpo are mutually exclusive")
+    if args.tgrpo:
+        args.time_conditioning = True
+    is_grpo = args.only_grpo
+    is_tgrpo = args.tgrpo
+    is_thrpo = (not is_grpo) and (not is_tgrpo) and args.time_conditioning
+    is_hrpo = (not is_grpo) and (not is_tgrpo) and (not args.time_conditioning)
+
+    if is_grpo:
         exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-mmlu-grpo-group{args.group_size}"
                     f"-lora{args.lora_rank}-temp{args.temperature}")
-    else:
-        exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-mmlu-group{args.group_size}"
+    elif is_tgrpo:
+        exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-mmlu-tgrpo-group{args.group_size}"
+                    f"-lora{args.lora_rank}-temp{args.temperature}")
+    elif is_thrpo:
+        exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-mmlu-thrpo-group{args.group_size}"
                     f"-lora{args.lora_rank}-rmin{args.residual_r_min}-temp{args.temperature}")
-    if args.time_conditioning:
+    else:
+        exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-mmlu-hrpo-group{args.group_size}"
+                    f"-lora{args.lora_rank}-rmin{args.residual_r_min}-temp{args.temperature}")
+    if is_thrpo:
         exp_name += "-tcond"
     resume_from_checkpoint = None
     if args.resume:
@@ -56,21 +71,29 @@ def main(args):
         load_in_8bit = False,
         fast_inference = False,
     )
-    if not args.only_grpo:
+    if not is_grpo:
         model.answer_start = ANSWER_START
-    if args.time_conditioning and not args.only_grpo:
+    if is_tgrpo:
+        model.disable_thinking_residual = True
+        model.model.disable_thinking_residual = True
+    if is_tgrpo or is_thrpo:
         from time_conditioning import enable_time_conditioning
         enable_time_conditioning(model)
 
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
-    modules_to_save = None if args.only_grpo else [
-        "thinking_residual_gate_r",
-        "thinking_residual_gate_i",
-        "thinking_residual_Lambda",
-    ]
-    if args.time_conditioning and modules_to_save is not None:
+    if is_grpo:
+        modules_to_save = None
+    elif is_tgrpo:
+        modules_to_save = []
+    else:
+        modules_to_save = [
+            "thinking_residual_gate_r",
+            "thinking_residual_gate_i",
+            "thinking_residual_Lambda",
+        ]
+    if (is_tgrpo or is_thrpo) and modules_to_save is not None:
         modules_to_save.extend([
             "time_progress_predictor", "sinusoidal_time_embedding",
             "adaln_proj",
@@ -87,7 +110,7 @@ def main(args):
         use_gradient_checkpointing = "unsloth",
         random_state = args.seed,
     )
-    if not args.only_grpo:
+    if is_hrpo or is_thrpo:
         model.model.model.thinking_residual_Lambda.reset_lambda_parameters(
             r_min = args.residual_r_min, r_max = args.residual_r_max,
         )
@@ -128,16 +151,16 @@ def main(args):
         args = training_args,
         train_dataset = dataset,
     )
-    if args.time_conditioning:
+    if is_tgrpo or is_thrpo:
         trainer.time_loss_weight = args.time_loss_weight
-    if not args.only_grpo:
+    if not is_grpo:
         patch_trainer_optimizer(
             trainer,
-            args.lr_residual_gate,
-            args.lr_residual_Lambda,
-            lr_time_conditioning=args.lr_time_conditioning if args.time_conditioning else None,
+            lr_thinking_residual_gate=None if is_tgrpo else args.lr_residual_gate,
+            thinking_residual_Lambda=None if is_tgrpo else args.lr_residual_Lambda,
+            lr_time_conditioning=args.lr_time_conditioning if (is_tgrpo or is_thrpo) else None,
         )
-    if (args.time_conditioning and not args.only_grpo
+    if (is_thrpo
             and resume_from_checkpoint is None and args.pretrain_time_predicator):
         from time_conditioning import pretrain_time_predictor
         print("Pretraining time predictor...")
@@ -186,6 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("--pretrain_time_samples", type=int, default=1024)
     parser.add_argument("--pretrain_time_epochs", type=int, default=3)
     parser.add_argument("--only_grpo", action="store_true", default=False)
+    parser.add_argument("--tgrpo", action="store_true", default=False)
     parser.add_argument("--resume", action="store_true", default=False)
     args = parser.parse_args()
 

@@ -32,7 +32,9 @@ DATASET_PATHS = {
 }
 
 
-def load_model(model_path, adapter_path, only_grpo=False):
+def load_model(model_path, adapter_path, only_grpo=False, tgrpo=False):
+    if only_grpo and tgrpo:
+        raise ValueError("--only_grpo and --tgrpo are mutually exclusive")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_path,
         max_seq_length = 3072,
@@ -41,6 +43,9 @@ def load_model(model_path, adapter_path, only_grpo=False):
     )
     if not only_grpo:
         model.answer_start = ANSWER_START
+    if tgrpo:
+        model.disable_thinking_residual = True
+        model.model.disable_thinking_residual = True
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -189,7 +194,7 @@ if __name__ == "__main__":
     temperature = detect_temperature(checkpoint_path)
     print(checkpoint_path, base_model, temperature)
 
-    model, tokenizer = load_model(base_model, checkpoint_path, only_grpo=args.only_grpo)
+    model, tokenizer = load_model(base_model, checkpoint_path, only_grpo=args.only_grpo, tgrpo=args.tgrpo)
 
     for dataset_code in ['nq', 'tq', '2wiki', 'hotpotqa', 'bamboogle']:
         results_file = f'eval_results_{dataset_code}.json'

@@ -39,7 +39,10 @@ def evaluate_model(
     num_samples: int = None,
     save_results: bool = True,
     only_grpo: bool = False,
+    tgrpo: bool = False,
 ):
+    if only_grpo and tgrpo:
+        raise ValueError("--only_grpo and --tgrpo are mutually exclusive")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name = model_path,
         max_seq_length = 4096,
@@ -48,6 +51,9 @@ def evaluate_model(
     )
     if not only_grpo:
         model.answer_start = ANSWER_START
+    if tgrpo:
+        model.disable_thinking_residual = True
+        model.model.disable_thinking_residual = True
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -207,4 +213,5 @@ if __name__ == "__main__":
             num_samples=None,
             save_results=True,
             only_grpo=args.only_grpo,
+            tgrpo=args.tgrpo,
         )

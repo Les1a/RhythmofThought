@@ -7,8 +7,7 @@
 # MMLU, and RAG tasks with paper-official hyperparameters.
 #
 # This is equivalent to run_hrpo_all.sh --time-cond, but with time conditioning
-# hardcoded. Experiment dirs use the same -tcond naming convention, so checkpoints
-# from prior run_hrpo_all.sh --time-cond runs are compatible.
+# hardcoded. Experiment dirs use an explicit `-thrpo-` marker plus `-tcond`.
 #
 # Smart skipping — by default won't re-train if checkpoints exist, won't re-eval if
 # results exist. Pass --resume to continue training from the latest checkpoint
@@ -130,7 +129,7 @@ get_exp_name() {
     local task="$1"
     local group_size="$2"
     local model_short="${MODEL##*/}"
-    local name="./experiments/${model_short}-${task}-group${group_size}-lora${LORA_RANK}-rmin${RESIDUAL_R_MIN}-temp${TEMPERATURE}"
+    local name="./experiments/${model_short}-${task}-thrpo-group${group_size}-lora${LORA_RANK}-rmin${RESIDUAL_R_MIN}-temp${TEMPERATURE}"
     [ "$TIME_CONDITIONING" = true ] && name="${name}-tcond"
     echo "$name"
 }
