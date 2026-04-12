@@ -1,16 +1,21 @@
 #!/bin/bash
 ###############################################################################
-# run_hrpo_all.sh — Unified HRPO Training & Evaluation Script
+# run_thrpo_all.sh — Unified THRPO Training & Evaluation Script
 #
-# Runs HRPO (Hybrid Latent Reasoning via RL) training and evaluation for
-# GSM8K, MATH, MMLU, and RAG tasks with paper-official hyperparameters.
+# Runs THRPO (Time-conditioned HRPO: Hybrid Latent Reasoning via RL with
+# time conditioning always enabled) training and evaluation for GSM8K, MATH,
+# MMLU, and RAG tasks with paper-official hyperparameters.
+#
+# This is equivalent to run_hrpo_all.sh --time-cond, but with time conditioning
+# hardcoded. Experiment dirs use the same -tcond naming convention, so checkpoints
+# from prior run_hrpo_all.sh --time-cond runs are compatible.
 #
 # Smart skipping — by default won't re-train if checkpoints exist, won't re-eval if
 # results exist. Pass --resume to continue training from the latest checkpoint
 # instead of skipping (full state restore: optimizer, scheduler, RNG, global_step).
 #
 # Usage:
-#   bash run_hrpo_all.sh [OPTIONS]
+#   bash run_thrpo_all.sh [OPTIONS]
 #
 # Options:
 #   --gpu ID              GPU device ID (default: 0)
@@ -23,12 +28,18 @@
 #                         experiment dir instead of skipping. Errors if a task's
 #                         experiment dir is missing or contains no checkpoint-*.
 #                         Hyperparameters must match the original run.
+#   --time-loss-weight V  Time conditioning loss weight (default: 0.1)
+#   --lr-time-cond V      Learning rate for time conditioning modules (default: 1e-4)
 #   --no-wandb            Disable WandB logging
 #   --prep-data           Run prepare_data.py for selected --tasks before training/eval
 #   --dry-run             Print commands without executing
 #   --help                Show this help message
 ###############################################################################
 set -eo pipefail
+
+# Prevent CUDA VMM (expandable_segments) from mapping ~2x GPU memory as shmem,
+# which causes cgroup OOM on nodes with strict memory limits (e.g., 256GB for H200).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:+${PYTORCH_CUDA_ALLOC_CONF},}expandable_segments:False"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="$SCRIPT_DIR"
@@ -70,9 +81,12 @@ NO_WANDB=false
 PREP_DATA=false
 DRY_RUN=false
 RESUME=false
-TIME_CONDITIONING=false
+TIME_CONDITIONING=true       # Always enabled for THRPO
 TIME_LOSS_WEIGHT=0.1
 LR_TIME_CONDITIONING=1e-4
+
+PRETRAIN_TIME_SAMPLES=4096
+PRETRAIN_TIME_EPOCHS=2
 FAILED_TASKS=()
 
 # ========================= Argument Parsing ==================================
@@ -99,7 +113,6 @@ while [[ $# -gt 0 ]]; do
         --no-wandb)   NO_WANDB=true; shift ;;
         --prep-data)  PREP_DATA=true; shift ;;
         --dry-run)    DRY_RUN=true; shift ;;
-        --time-cond)  TIME_CONDITIONING=true; shift ;;
         --time-loss-weight) TIME_LOSS_WEIGHT="$2"; shift 2 ;;
         --lr-time-cond)     LR_TIME_CONDITIONING="$2"; shift 2 ;;
         --help|-h)    show_help ;;
@@ -207,7 +220,7 @@ train_task() {
         return 1
     fi
 
-    local logfile="${LOG_DIR}/${task}_train_$(date +%Y%m%d_%H%M%S).log"
+    local logfile="${LOG_DIR}/thrpo_${task}_train_$(date +%Y%m%d_%H%M%S).log"
     local script="hrpo_${task}.py"
 
     if [ "$DRY_RUN" = true ]; then
@@ -215,7 +228,9 @@ train_task() {
         [ -n "$dataset_root" ] && echo "    --dataset_root ${dataset_root} \\"
         echo "    --per_device_train_batch_size ${bs} --gradient_accumulation_steps ${ga} \\"
         echo "    --group_size ${group_size} --max_prompt_length ${max_prompt} --max_completion_length ${max_completion} \\"
-        echo "    --model_name ${MODEL} --lora_rank ${LORA_RANK} --lr ${LR} --beta ${BETA} --temperature ${TEMPERATURE} --seed ${SEED}${resume_arg:+ ${resume_arg}}"
+        echo "    --model_name ${MODEL} --lora_rank ${LORA_RANK} --lr ${LR} --beta ${BETA} --temperature ${TEMPERATURE} --seed ${SEED}${resume_arg:+ ${resume_arg}} \\"
+        echo "    --time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING} \\"
+        echo "    --pretrain_time_samples ${PRETRAIN_TIME_SAMPLES} --pretrain_time_epochs ${PRETRAIN_TIME_EPOCHS}"
         return 0
     fi
 
@@ -242,7 +257,8 @@ train_task() {
         --max_grad_norm ${MAX_GRAD_NORM} \
         --temperature ${TEMPERATURE} \
         --seed ${SEED} \
-        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" ) \
+        --time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING} \
+        --pretrain_time_samples ${PRETRAIN_TIME_SAMPLES} --pretrain_time_epochs ${PRETRAIN_TIME_EPOCHS} \
         2>&1 | tee "${logfile}"
 }
 
@@ -270,7 +286,7 @@ eval_gsm8k() {
     fi
 
     log "$task" "Evaluating checkpoint: ${ckpt}"
-    local logfile="${LOG_DIR}/gsm8k_eval_$(date +%Y%m%d_%H%M%S).log"
+    local logfile="${LOG_DIR}/thrpo_gsm8k_eval_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_gsm8k.py --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
@@ -301,7 +317,7 @@ eval_math() {
     fi
 
     log "$task" "Evaluating checkpoint: ${ckpt}"
-    local logfile="${LOG_DIR}/math_eval_$(date +%Y%m%d_%H%M%S).log"
+    local logfile="${LOG_DIR}/thrpo_math_eval_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_math.py --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
@@ -332,7 +348,7 @@ eval_mmlu() {
     fi
 
     log "$task" "Evaluating checkpoint: ${ckpt}"
-    local logfile="${LOG_DIR}/mmlu_eval_$(date +%Y%m%d_%H%M%S).log"
+    local logfile="${LOG_DIR}/thrpo_mmlu_eval_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_mmlust.py --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
@@ -363,7 +379,7 @@ eval_arcc() {
     fi
 
     log "$task" "Evaluating checkpoint: ${ckpt}"
-    local logfile="${LOG_DIR}/arcc_eval_$(date +%Y%m%d_%H%M%S).log"
+    local logfile="${LOG_DIR}/thrpo_arcc_eval_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_arcc.py --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
@@ -417,7 +433,7 @@ eval_rag() {
     fi
 
     log "$task" "Evaluating checkpoint: ${ckpt}"
-    local logfile="${LOG_DIR}/rag_eval_$(date +%Y%m%d_%H%M%S).log"
+    local logfile="${LOG_DIR}/thrpo_rag_eval_$(date +%Y%m%d_%H%M%S).log"
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_rag.py --checkpoint_path ${ckpt} --batch_size ${EVAL_BS}"
@@ -434,11 +450,12 @@ eval_rag() {
 print_summary() {
     echo ""
     echo "============================================================"
-    echo "                   HRPO Pipeline Summary"
+    echo "                  THRPO Pipeline Summary"
     echo "============================================================"
     echo "Model:  ${MODEL}"
     echo "GPU:    ${GPU_ID}"
     echo "Tasks:  ${TASKS}"
+    echo "Time conditioning: weight=${TIME_LOSS_WEIGHT}, lr=${LR_TIME_CONDITIONING}, pretrain=${PRETRAIN_TIME_SAMPLES}x${PRETRAIN_TIME_EPOCHS}ep"
     echo ""
 
     for task in "${TASK_LIST[@]}"; do
@@ -535,11 +552,12 @@ print(f\"{d['metrics']['accuracy']:.4f}\")
 # ========================= Main ==============================================
 main() {
     log "MAIN" "=========================================="
-    log "MAIN" "HRPO Training & Evaluation Pipeline"
+    log "MAIN" "THRPO Training & Evaluation Pipeline"
     log "MAIN" "=========================================="
     log "MAIN" "Model:       ${MODEL}"
     log "MAIN" "GPU:         ${GPU_ID}"
     log "MAIN" "Tasks:       ${TASKS}"
+    log "MAIN" "Time cond:   enabled (weight=${TIME_LOSS_WEIGHT}, lr=${LR_TIME_CONDITIONING})"
     log "MAIN" "Eval only:   ${EVAL_ONLY}"
     log "MAIN" "Skip eval:   ${SKIP_EVAL}"
     log "MAIN" "Resume:      ${RESUME}"
@@ -608,7 +626,7 @@ main() {
     # Training phase
     if [ "$EVAL_ONLY" != true ]; then
         for task in "${TASK_LIST[@]}"; do
-            log "MAIN" "==================== Training: ${task} ===================="
+            log "MAIN" "==================== Training THRPO: ${task} ===================="
             if ! "train_${task}"; then
                 log "MAIN" "WARNING: Training ${task} failed"
                 FAILED_TASKS+=("train_${task}")
@@ -619,14 +637,14 @@ main() {
     # Evaluation phase
     if [ "$SKIP_EVAL" != true ]; then
         for task in "${TASK_LIST[@]}"; do
-            log "MAIN" "==================== Evaluating: ${task} ===================="
+            log "MAIN" "==================== Evaluating THRPO: ${task} ===================="
             if ! "eval_${task}"; then
                 log "MAIN" "WARNING: Evaluation ${task} failed"
                 FAILED_TASKS+=("eval_${task}")
             fi
             # ARC-C shares checkpoint with MMLU (paper trains on merged MMLU+ARC-C)
             if [ "$task" = "mmlu" ]; then
-                log "MAIN" "==================== Evaluating: arcc (from mmlu checkpoint) ===================="
+                log "MAIN" "==================== Evaluating THRPO: arcc (from mmlu checkpoint) ===================="
                 if ! eval_arcc; then
                     log "MAIN" "WARNING: Evaluation arcc failed"
                     FAILED_TASKS+=("eval_arcc")

@@ -51,6 +51,8 @@ def evaluate_model(
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
+    from time_conditioning import detect_time_conditioning
+    detect_time_conditioning(model, adapter_path)
     model.load_adapter(adapter_path)
     model = FastLanguageModel.for_inference(model)
 
@@ -186,12 +188,12 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
-    from utils import detect_base_model, create_eval_parser
+    from utils import detect_base_model, detect_temperature, create_eval_parser
 
     args = create_eval_parser().parse_args()
     checkpoint_path = args.checkpoint_path
     base_model = detect_base_model(checkpoint_path)
-    temperature = float(checkpoint_path.split('-temp')[-1].split('/')[0])
+    temperature = detect_temperature(checkpoint_path)
     print(checkpoint_path, base_model, temperature)
 
     if not os.path.exists(os.path.join(checkpoint_path, 'eval_results.json')):

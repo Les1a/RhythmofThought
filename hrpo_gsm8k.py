@@ -27,6 +27,8 @@ def main(args):
     else:
         exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-gsm8k-group{args.group_size}"
                     f"-lora{args.lora_rank}-rmin{args.residual_r_min}-temp{args.temperature}")
+    if args.time_conditioning:
+        exp_name += "-tcond"
     resume_from_checkpoint = None
     if args.resume:
         if not os.path.exists(exp_name):
@@ -50,6 +52,9 @@ def main(args):
     )
     if not args.only_grpo:
         model.answer_start = ANSWER_START
+    if args.time_conditioning and not args.only_grpo:
+        from time_conditioning import enable_time_conditioning
+        enable_time_conditioning(model)
 
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
@@ -59,6 +64,11 @@ def main(args):
         "thinking_residual_gate_i",
         "thinking_residual_Lambda",
     ]
+    if args.time_conditioning and modules_to_save is not None:
+        modules_to_save.extend([
+            "time_progress_predictor", "sinusoidal_time_embedding",
+            "adaln_proj",
+        ])
     model = FastLanguageModel.get_peft_model(
         model,
         r = args.lora_rank,
@@ -75,7 +85,6 @@ def main(args):
         model.model.model.thinking_residual_Lambda.reset_lambda_parameters(
             r_min = args.residual_r_min, r_max = args.residual_r_max,
         )
-
     training_args = GRPOConfig(
         use_vllm = False,
         learning_rate = args.lr,
@@ -99,7 +108,7 @@ def main(args):
         num_train_epochs = 1,
         save_steps = 250,
         save_total_limit = 3,
-        report_to = "wandb",
+        report_to = "none" if os.environ.get("WANDB_DISABLED", "").lower() == "true" else "wandb",
         output_dir = exp_name,
     )
 
@@ -113,11 +122,28 @@ def main(args):
         args = training_args,
         train_dataset = dataset,
     )
+    if args.time_conditioning:
+        trainer.time_loss_weight = args.time_loss_weight
     if not args.only_grpo:
         patch_trainer_optimizer(
             trainer,
             args.lr_residual_gate,
             args.lr_residual_Lambda,
+            lr_time_conditioning=args.lr_time_conditioning if args.time_conditioning else None,
+        )
+
+    if (args.time_conditioning and not args.only_grpo
+            and resume_from_checkpoint is None and args.pretrain_time_predicator):
+        print("Pretraining time predictor...")
+        from time_conditioning import pretrain_time_predictor
+        pretrain_time_predictor(
+            model, tokenizer, dataset,
+            num_samples=args.pretrain_time_samples,
+            num_epochs=args.pretrain_time_epochs,
+            lr=args.lr_time_conditioning,
+            temperature=args.temperature,
+            max_completion_length=args.max_completion_length,
+            batch_size=128,
         )
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
@@ -147,6 +173,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--time_conditioning", action="store_true", default=False)
+    parser.add_argument("--time_loss_weight", type=float, default=0.1)
+    parser.add_argument("--lr_time_conditioning", type=float, default=1e-4)
+    parser.add_argument("--pretrain_time_predicator", action="store_true", default=False)
+    parser.add_argument("--pretrain_time_samples", type=int, default=1024)
+    parser.add_argument("--pretrain_time_epochs", type=int, default=3)
     parser.add_argument("--only_grpo", action="store_true", default=False)
     parser.add_argument("--resume", action="store_true", default=False)
     args = parser.parse_args()

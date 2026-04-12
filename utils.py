@@ -11,6 +11,13 @@ BASE_MODELS = [
 ]
 
 
+def detect_temperature(checkpoint_path):
+    """Extract temperature from checkpoint path, handling suffixes like -tcond."""
+    import re
+    m = re.search(r'-temp([0-9.]+)', checkpoint_path)
+    return float(m.group(1)) if m else 0.5
+
+
 def detect_base_model(checkpoint_path, base_models=None):
     if base_models is None:
         base_models = BASE_MODELS

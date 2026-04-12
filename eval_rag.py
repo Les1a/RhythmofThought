@@ -44,6 +44,8 @@ def load_model(model_path, adapter_path, only_grpo=False):
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
 
+    from time_conditioning import detect_time_conditioning
+    detect_time_conditioning(model, adapter_path)
     model.load_adapter(adapter_path)
     model = FastLanguageModel.for_inference(model)
     return model, tokenizer
@@ -176,7 +178,7 @@ def evaluate_benchmark(
 
 
 if __name__ == "__main__":
-    from utils import detect_base_model, create_eval_parser
+    from utils import detect_base_model, detect_temperature, create_eval_parser
 
     parser = create_eval_parser()
     parser.add_argument("--eval_examples", type=int, default=None)
@@ -184,7 +186,7 @@ if __name__ == "__main__":
 
     checkpoint_path = args.checkpoint_path
     base_model = detect_base_model(checkpoint_path)
-    temperature = float(checkpoint_path.split('-temp')[-1].split('/')[0])
+    temperature = detect_temperature(checkpoint_path)
     print(checkpoint_path, base_model, temperature)
 
     model, tokenizer = load_model(base_model, checkpoint_path, only_grpo=args.only_grpo)
