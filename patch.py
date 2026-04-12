@@ -20,70 +20,75 @@ def patch_trainer_optimizer(
         if self.optimizer is None:
             decay_parameters = self.get_decay_parameter_names(opt_model)
             _special = ("thinking_residual", "adaln_", "time_progress_predictor", "sinusoidal_time_embedding")
+
             def _is_special(n):
                 return any(s in n for s in _special)
+
+            def _collect_group_params(predicate, use_decay):
+                return [
+                    p
+                    for n, p in opt_model.named_parameters()
+                    if predicate(n)
+                    and (n in decay_parameters) is use_decay
+                    and p.requires_grad
+                ]
+
+            def _append_split_groups(groups, predicate, lr):
+                if lr is None:
+                    return
+                decay_group = _collect_group_params(predicate, use_decay=True)
+                no_decay_group = _collect_group_params(predicate, use_decay=False)
+                if decay_group:
+                    groups.append(
+                        {
+                            "params": decay_group,
+                            "lr": lr,
+                            "weight_decay": self.args.weight_decay,
+                        }
+                    )
+                if no_decay_group:
+                    groups.append(
+                        {
+                            "params": no_decay_group,
+                            "lr": lr,
+                            "weight_decay": 0.0,
+                        }
+                    )
+
             optimizer_grouped_parameters = [
                 {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if (not _is_special(n) and n in decay_parameters and p.requires_grad)
-                    ],
+                    "params": _collect_group_params(lambda n: not _is_special(n), use_decay=True),
                     "lr": self.args.learning_rate,
                     "weight_decay": self.args.weight_decay,
                 },
                 {
-                    "params": [
-                        p for n, p in opt_model.named_parameters() if (not _is_special(n) and n not in decay_parameters and p.requires_grad)
-                    ],
+                    "params": _collect_group_params(lambda n: not _is_special(n), use_decay=False),
                     "lr": self.args.learning_rate,
                     "weight_decay": 0.0,
                 },
             ]
+            optimizer_grouped_parameters = [
+                group for group in optimizer_grouped_parameters if group["params"]
+            ]
 
-            if lr_thinking_residual_gate is not None:
-                optimizer_grouped_parameters.append(
-                    {
-                        "params": [
-                            p for n, p in opt_model.named_parameters() if ("thinking_residual_gate" in n and p.requires_grad)
-                        ],
-                        "lr": lr_thinking_residual_gate,
-                        "weight_decay": self.args.weight_decay,
-                    }
-                )
-            if thinking_residual_Lambda is not None:
-                optimizer_grouped_parameters.append(
-                    {
-                        "params": [
-                            p for n, p in opt_model.named_parameters() if ("thinking_residual_Lambda" in n and p.requires_grad)
-                        ],
-                        "lr": thinking_residual_Lambda,
-                        "weight_decay": self.args.weight_decay,
-                    }
-                )
+            _append_split_groups(
+                optimizer_grouped_parameters,
+                lambda n: "thinking_residual_gate" in n,
+                lr_thinking_residual_gate,
+            )
+            _append_split_groups(
+                optimizer_grouped_parameters,
+                lambda n: "thinking_residual_Lambda" in n,
+                thinking_residual_Lambda,
+            )
 
             if lr_time_conditioning is not None:
                 _tc_names = ("sinusoidal_time_embedding", "adaln_proj", "time_progress_predictor")
-                optimizer_grouped_parameters.extend([
-                    {
-                        "params": [
-                            p for n, p in opt_model.named_parameters()
-                            if any(tc in n for tc in _tc_names)
-                            and n in decay_parameters
-                            and p.requires_grad
-                        ],
-                        "lr": lr_time_conditioning,
-                        "weight_decay": self.args.weight_decay,
-                    },
-                    {
-                        "params": [
-                            p for n, p in opt_model.named_parameters()
-                            if any(tc in n for tc in _tc_names)
-                            and n not in decay_parameters
-                            and p.requires_grad
-                        ],
-                        "lr": lr_time_conditioning,
-                        "weight_decay": 0.0,
-                    },
-                ])
+                _append_split_groups(
+                    optimizer_grouped_parameters,
+                    lambda n: any(tc in n for tc in _tc_names),
+                    lr_time_conditioning,
+                )
 
             if self.optimizer_cls_and_kwargs is not None:
                 optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
