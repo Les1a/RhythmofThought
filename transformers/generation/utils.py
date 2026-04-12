@@ -3292,6 +3292,10 @@ class GenerationMixin:
         embeds_ratio = [
             torch.ones_like(input_ids, dtype=torch.float32, device=input_ids.device)
         ] if return_thinking_embeds else []
+        time_preds = [
+            torch.zeros(input_ids.shape[0], input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
+        ] if return_thinking_embeds else []
+
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
@@ -3380,6 +3384,10 @@ class GenerationMixin:
                 embeds_ratio.append(
                     torch.tensor(outputs.hidden_states[2], device=input_ids.device).unsqueeze(1)
                 )
+                if len(outputs.hidden_states) > 3 and outputs.hidden_states[3] is not None:
+                    time_preds.append(outputs.hidden_states[3])
+                else:
+                    time_preds.append(torch.zeros(input_ids.shape[0], 1, dtype=torch.float32, device=input_ids.device))
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
             this_peer_finished = unfinished_sequences.max() == 0
@@ -3423,7 +3431,10 @@ class GenerationMixin:
                 embeds_ratio.append(
                     torch.ones_like(input_ids[:, -1:], dtype=torch.float32, device=input_ids.device)
                 )
-                return input_ids, torch.cat(thinking_embeds, dim=1), torch.cat(thinking_mask, dim=1), torch.cat(embeds_ratio, dim=1)
+                # Carry the last available rollout prediction forward to the
+                # final generated token instead of fabricating a trailing zero.
+                time_preds.append(time_preds[-1][:, -1:].clone())
+                return input_ids, torch.cat(thinking_embeds, dim=1), torch.cat(thinking_mask, dim=1), torch.cat(embeds_ratio, dim=1), torch.cat(time_preds, dim=1)
             else:
                 return input_ids
 

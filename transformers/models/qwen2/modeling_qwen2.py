@@ -35,6 +35,12 @@ from ...utils import (
 from ...utils.deprecation import deprecate_kwarg
 from .configuration_qwen2 import Qwen2Config
 
+try:
+    from time_conditioning import AdaLNProjection, TimeProgressPredictor, SinusoidalTimeEmbedding
+    _HAS_TIME_CONDITIONING = True
+except ImportError:
+    _HAS_TIME_CONDITIONING = False
+
 
 logger = logging.get_logger(__name__)
 
@@ -234,6 +240,13 @@ class Qwen2DecoderLayer(nn.Module):
         self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        if _HAS_TIME_CONDITIONING and getattr(config, 'use_time_conditioning', False):
+            self.adaln_proj = AdaLNProjection(
+                time_embed_dim=getattr(config, 'time_embed_dim', 256),
+                hidden_size=config.hidden_size,
+            )
+
         if config.sliding_window and config._attn_implementation != "flash_attention_2":
             logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
@@ -250,11 +263,28 @@ class Qwen2DecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        time_emb: Optional[torch.Tensor] = None,
+        time_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        # Per-layer AdaLN: compute scale/shift/gate for both norms
+        if time_emb is not None and hasattr(self, 'adaln_proj'):
+            gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.adaln_proj(time_emb)
+            if time_mask is not None:
+                # Masked AdaLN: identity for non-thinking positions
+                m = time_mask.unsqueeze(-1).to(dtype=gamma1.dtype)  # (B, N, 1)
+                gamma1, beta1 = gamma1 * m, beta1 * m
+                alpha1 = 1.0 + (alpha1 - 1.0) * m
+                gamma2, beta2 = gamma2 * m, beta2 * m
+                alpha2 = 1.0 + (alpha2 - 1.0) * m
+        else:
+            gamma1 = beta1 = alpha1 = gamma2 = beta2 = alpha2 = None
+
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
+        if gamma1 is not None:
+            hidden_states = hidden_states * (1 + gamma1) + beta1
 
         # Self Attention
         hidden_states, self_attn_weights = self.self_attn(
@@ -268,13 +298,24 @@ class Qwen2DecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        hidden_states = residual + hidden_states
+        # Gated residual
+        if alpha1 is not None:
+            hidden_states = residual + alpha1 * hidden_states
+        else:
+            hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if gamma2 is not None:
+            hidden_states = hidden_states * (1 + gamma2) + beta2
+
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        # Gated residual
+        if alpha2 is not None:
+            hidden_states = residual + alpha2 * hidden_states
+        else:
+            hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
         if output_attentions:
@@ -518,6 +559,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.thinking_residual_gate_i = nn.Linear(config.hidden_size, config.hidden_size)
         self.thinking_residual_Lambda = ThinkingResidualLambda(config)
 
+        if _HAS_TIME_CONDITIONING and getattr(config, 'use_time_conditioning', False):
+            _te_dim = getattr(config, 'time_embed_dim', 256)
+            self.time_progress_predictor = TimeProgressPredictor(config.hidden_size)
+            self.sinusoidal_time_embedding = SinusoidalTimeEmbedding(time_embed_dim=_te_dim)
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -585,6 +631,32 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         hidden_states = inputs_embeds
 
+        # Time conditioning: dual mode (GT for training, predictor for rollout/inference)
+        time_emb = None
+        time_mask = None
+        _is_thinking_t = None  # cached tensor for is_thinking (avoid repeated creation)
+        if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
+            _gt = getattr(self, '_gt_time_emb', None)
+            if _gt is not None:
+                # GT mode (training): use pre-computed time embeddings
+                time_emb = _gt
+                time_mask = getattr(self, '_gt_time_mask', None)
+            else:
+                # Predictor mode (rollout/inference): use cached hidden state
+                _cached = getattr(self, '_cached_last_hidden', None)
+                if _cached is not None and _cached.shape[0] == inputs_embeds.shape[0]:
+                    with torch.no_grad():
+                        _t_cached = self.time_progress_predictor(_cached)
+                        time_emb = self.sinusoidal_time_embedding(_t_cached)
+                # Gate by is_thinking in predictor mode
+                _is_thinking = flash_attn_kwargs.get('is_thinking', None)
+                if _is_thinking is not None:
+                    _is_thinking_t = torch.tensor(_is_thinking, device=inputs_embeds.device)
+                    if time_emb is not None:
+                        time_mask = _is_thinking_t.to(dtype=torch.bool)
+                        if time_mask.dim() == 1:
+                            time_mask = time_mask.unsqueeze(1)
+
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
@@ -607,6 +679,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    time_emb,
+                    time_mask,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -618,6 +692,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    time_emb=time_emb,
+                    time_mask=time_mask,
                     **flash_attn_kwargs,
                 )
 
@@ -627,6 +703,17 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
+        # Time conditioning: always run predictor (aux loss during training, cache during rollout)
+        if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
+            self._last_time_pred = self.time_progress_predictor(hidden_states.detach())
+            if getattr(self, '_gt_time_emb', None) is None:
+                # Rollout/inference: cache hidden state for next decode step (only thinking positions)
+                _new_hidden = hidden_states[:, -1:, :].detach()
+                _old_hidden = getattr(self, '_cached_last_hidden', None)
+                if _is_thinking_t is not None and _old_hidden is not None and _old_hidden.shape == _new_hidden.shape:
+                    self._cached_last_hidden = torch.where(_is_thinking_t.view(-1, 1, 1), _new_hidden, _old_hidden)
+                else:
+                    self._cached_last_hidden = _new_hidden
 
         # add hidden states from the last decoder layer
         if output_hidden_states:

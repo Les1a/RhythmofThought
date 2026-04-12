@@ -516,9 +516,26 @@ def LlamaDecoderLayer_fast_forward(
             (see `past_key_values`).
         past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
     """
+    # Time conditioning: per-layer AdaLN (with optional mask for training)
+    time_emb = kwargs.get('time_emb')
+    time_mask = kwargs.get('time_mask')
+    if time_emb is not None and hasattr(self, 'adaln_proj'):
+        _g1, _b1, _a1, _g2, _b2, _a2 = self.adaln_proj(time_emb)
+        if time_mask is not None:
+            _m = time_mask.unsqueeze(-1).to(dtype=_g1.dtype)
+            _g1, _b1 = _g1 * _m, _b1 * _m
+            _a1 = 1.0 + (_a1 - 1.0) * _m
+            _g2, _b2 = _g2 * _m, _b2 * _m
+            _a2 = 1.0 + (_a2 - 1.0) * _m
+    else:
+        _g1 = _b1 = _a1 = _g2 = _b2 = _a2 = None
+
     if use_cache and hasattr(self, "_flag_for_generation"):
         residual = hidden_states
         hidden_states = fast_rms_layernorm_inference(self.input_layernorm, hidden_states)
+        if _g1 is not None:
+            _hd = hidden_states.dtype
+            hidden_states = hidden_states * (1 + _g1.to(_hd)) + _b1.to(_hd)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states       = hidden_states,
             causal_mask         = causal_mask,
@@ -530,16 +547,28 @@ def LlamaDecoderLayer_fast_forward(
             padding_mask        = padding_mask,
             position_embeddings = position_embeddings,
         )
-        hidden_states += residual
+        if _a1 is not None:
+            hidden_states = residual + _a1.to(hidden_states.dtype) * hidden_states
+        else:
+            hidden_states += residual
 
         # Fully Connected
         residual = hidden_states
         hidden_states = fast_rms_layernorm_inference(self.post_attention_layernorm, hidden_states)
+        if _g2 is not None:
+            _hd = hidden_states.dtype
+            hidden_states = hidden_states * (1 + _g2.to(_hd)) + _b2.to(_hd)
         hidden_states = fast_swiglu_inference(self.mlp, hidden_states)
-        hidden_states += residual
+        if _a2 is not None:
+            hidden_states = residual + _a2.to(hidden_states.dtype) * hidden_states
+        else:
+            hidden_states += residual
     else:
         residual = hidden_states
         hidden_states = fast_rms_layernorm(self.input_layernorm, hidden_states)
+        if _g1 is not None:
+            _hd = hidden_states.dtype
+            hidden_states = hidden_states * (1 + _g1.to(_hd)) + _b1.to(_hd)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states       = hidden_states,
             causal_mask         = causal_mask,
@@ -551,13 +580,22 @@ def LlamaDecoderLayer_fast_forward(
             padding_mask        = padding_mask,
             position_embeddings = position_embeddings,
         )
-        hidden_states = residual + hidden_states
+        if _a1 is not None:
+            hidden_states = residual + _a1.to(hidden_states.dtype) * hidden_states
+        else:
+            hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = fast_rms_layernorm(self.post_attention_layernorm, hidden_states)
+        if _g2 is not None:
+            _hd = hidden_states.dtype
+            hidden_states = hidden_states * (1 + _g2.to(_hd)) + _b2.to(_hd)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        if _a2 is not None:
+            hidden_states = residual + _a2.to(hidden_states.dtype) * hidden_states
+        else:
+            hidden_states = residual + hidden_states
     pass
 
     outputs = (hidden_states,)
@@ -746,6 +784,30 @@ def LlamaModel_fast_forward(
     pass
 
     hidden_states = inputs_embeds
+
+    # Time conditioning: dual mode (GT for training, predictor for rollout/inference)
+    _time_emb = None
+    _time_mask = None
+    if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
+        _gt = getattr(self, '_gt_time_emb', None)
+        if _gt is not None:
+            # GT mode (training): use pre-computed time embeddings
+            _time_emb = _gt
+            _time_mask = getattr(self, '_gt_time_mask', None)
+        else:
+            # Predictor mode (rollout/inference)
+            _cached = getattr(self, '_cached_last_hidden', None)
+            if _cached is not None and _cached.shape[0] == inputs_embeds.shape[0]:
+                with torch.no_grad():
+                    _t_cached = self.time_progress_predictor(_cached)
+                    _time_emb = self.sinusoidal_time_embedding(_t_cached)
+            # Gate by is_thinking in predictor mode (match standard path)
+            _is_thinking = kwargs.get('is_thinking', None)
+            if _is_thinking is not None and _time_emb is not None:
+                _time_mask = torch.tensor(_is_thinking, dtype=torch.bool, device=inputs_embeds.device)
+                if _time_mask.dim() == 1:
+                    _time_mask = _time_mask.unsqueeze(1)
+
     if IS_GRANITE: #granite has embedding multiplier
         hidden_states = self.embedding_multiplier * hidden_states
 
@@ -862,7 +924,10 @@ def LlamaModel_fast_forward(
         if gradient_checkpointing:
             def create_custom_forward(module):
                 def custom_forward(*inputs):
-                    return module(*inputs, past_key_value, output_attentions, padding_mask = padding_mask, position_embeddings = position_embeddings)
+                    *_base, _te, _tm = inputs
+                    _te = _te if _te.numel() > 0 else None
+                    _tm = _tm if _tm.numel() > 0 else None
+                    return module(*_base, past_key_value, output_attentions, padding_mask = padding_mask, position_embeddings = position_embeddings, time_emb = _te, time_mask = _tm)
                 return custom_forward
             pass
             layer_outputs = torch.utils.checkpoint.checkpoint(
@@ -871,6 +936,8 @@ def LlamaModel_fast_forward(
                 mask,
                 attention_mask,
                 position_ids,
+                _time_emb if _time_emb is not None else torch.empty(0, device=hidden_states.device),
+                _time_mask if _time_mask is not None else torch.empty(0, device=hidden_states.device),
                 use_reentrant = True,
                 preserve_rng_state = False,
             )
@@ -887,6 +954,8 @@ def LlamaModel_fast_forward(
                 use_cache           = use_cache,
                 padding_mask        = padding_mask,
                 position_embeddings = position_embeddings,
+                time_emb            = _time_emb,
+                time_mask           = _time_mask,
             )
             hidden_states = layer_outputs[0]
         pass
@@ -905,6 +974,19 @@ def LlamaModel_fast_forward(
     else:
         hidden_states = fast_rms_layernorm(self.norm, hidden_states, gemma = IS_GEMMA)
     pass
+    # Time conditioning: always run predictor (aux loss during training, cache during rollout)
+    if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
+        self._last_time_pred = self.time_progress_predictor(hidden_states.detach())
+        if getattr(self, '_gt_time_emb', None) is None:
+            # Rollout/inference: cache hidden state for next decode step (only thinking positions)
+            _new_hidden = hidden_states[:, -1:, :].detach()
+            _is_thinking = kwargs.get('is_thinking', None)
+            _old_hidden = getattr(self, '_cached_last_hidden', None)
+            if _is_thinking is not None and _old_hidden is not None and _old_hidden.shape == _new_hidden.shape:
+                _thinking_t = torch.tensor(_is_thinking, device=hidden_states.device).view(-1, 1, 1)
+                self._cached_last_hidden = torch.where(_thinking_t, _new_hidden, _old_hidden)
+            else:
+                self._cached_last_hidden = _new_hidden
 
     if output_hidden_states: all_hidden_states += (hidden_states,)
     next_cache = next_decoder_cache if use_cache else None
@@ -937,17 +1019,40 @@ def LlamaModel_fast_forward_inference(
     X = self.model.embed_tokens(input_ids)
     X = X.to(_get_dtype(self.config.torch_dtype))
 
+    # Time conditioning: use CACHED hidden state from previous decode step
+    # Short-circuit: skip TC entirely once all batch elements have stopped thinking
+    _time_emb_inf = None
     is_thinking = kwargs.get('is_thinking')
+    if getattr(self.model, 'use_time_conditioning', False) and hasattr(self.model, 'time_progress_predictor'):
+        if is_thinking is None or any(is_thinking):
+            _cached = getattr(self.model, '_cached_last_hidden', None)
+            if _cached is not None and _cached.shape[0] == X.shape[0]:
+                with torch.no_grad():
+                    _t_cached = self.model.time_progress_predictor(_cached)
+                    self.model._used_time_pred = _t_cached  # store time used for AdaLN
+                    _time_emb_inf = self.model.sinusoidal_time_embedding(_t_cached)
+            else:
+                self.model._used_time_pred = torch.zeros(X.shape[0], 1, device=X.device)
+        else:
+            # All thinking stopped: zero out so stale predictions are not collected
+            self.model._used_time_pred = torch.zeros(X.shape[0], 1, device=X.device)
+
     last_thinking_states = kwargs.get('last_thinking_states')
+    thinking_embeds = None
+    embeds_ratio = torch.ones(X.shape[0], dtype=X.dtype, device=X.device)
     if is_thinking is not None and last_thinking_states is not None:
         thinking_embeds = last_thinking_states
         X_hat, a_t = self.model.thinking_residual(
             X, last_thinking_states.unsqueeze(1),
         )
-        embeds_ratio = a_t.mean(-1).squeeze()
+        embeds_ratio = a_t.mean(-1).flatten()
         embeds_ratio[~torch.tensor(is_thinking)] = 1.
         X[is_thinking] = X_hat[is_thinking].to(X.dtype)
 
+    # Gate time conditioning by is_thinking during decode
+    _tc_mask_inf = None
+    if _time_emb_inf is not None and is_thinking is not None:
+        _tc_mask_inf = torch.tensor(is_thinking, dtype=_time_emb_inf.dtype, device=_time_emb_inf.device).view(-1, 1, 1)
 
     bsz, q_len, hd = X.shape
     assert(q_len == 1)
@@ -975,6 +1080,17 @@ def LlamaModel_fast_forward_inference(
     next_decoder_cache = []
 
     for idx, decoder_layer in enumerate(self.model.layers):
+        # Per-layer AdaLN for decode (gated by is_thinking)
+        if _time_emb_inf is not None and hasattr(decoder_layer, 'adaln_proj'):
+            _dg1, _db1, _da1, _dg2, _db2, _da2 = decoder_layer.adaln_proj(_time_emb_inf)
+            if _tc_mask_inf is not None:
+                _dg1, _db1 = _dg1 * _tc_mask_inf, _db1 * _tc_mask_inf
+                _da1 = 1.0 + (_da1 - 1.0) * _tc_mask_inf
+                _dg2, _db2 = _dg2 * _tc_mask_inf, _db2 * _tc_mask_inf
+                _da2 = 1.0 + (_da2 - 1.0) * _tc_mask_inf
+        else:
+            _dg1 = _db1 = _da1 = _dg2 = _db2 = _da2 = None
+
         residual.copy_(X) # residual = X
         X = fast_rms_layernorm_inference(
             decoder_layer.input_layernorm,
@@ -983,6 +1099,9 @@ def LlamaModel_fast_forward_inference(
             XX2 = XX2,
             variance = variance,
         )
+        if _dg1 is not None:
+            _xd = X.dtype
+            X = X * (1 + _dg1.to(_xd)) + _db1.to(_xd)
         X, present_key_value = LlamaAttention_fast_forward_inference(
             decoder_layer.self_attn,
             hidden_states = X,
@@ -991,7 +1110,12 @@ def LlamaModel_fast_forward_inference(
             attention_mask = attention_mask,
             do_prefill = not hasattr(decoder_layer.self_attn, "paged_attention"),
         )
-        X += residual
+        if _da1 is not None:
+            # In-place to preserve X's bf16 dtype (residual is float32)
+            X *= _da1.to(X.dtype)
+            X += residual
+        else:
+            X += residual
 
         residual.copy_(X) # residual = X
         X = fast_rms_layernorm_inference(
@@ -1001,13 +1125,21 @@ def LlamaModel_fast_forward_inference(
             XX2 = XX2,
             variance = variance,
         )
+        if _dg2 is not None:
+            _xd = X.dtype
+            X = X * (1 + _dg2.to(_xd)) + _db2.to(_xd)
         X = fast_swiglu_inference(
             decoder_layer.mlp,
             X,
             temp_gate = temp_gate,
             temp_up = temp_up,
         )
-        X += residual
+        if _da2 is not None:
+            # In-place to preserve X's bf16 dtype
+            X *= _da2.to(X.dtype)
+            X += residual
+        else:
+            X += residual
 
         next_decoder_cache.append(present_key_value)
     pass
@@ -1018,11 +1150,25 @@ def LlamaModel_fast_forward_inference(
         XX2 = XX2,
         variance = variance,
     )
+    # Time conditioning: predict from current hidden states and cache for next decode step
+    # Only update cache for thinking elements; freeze cache once is_thinking=False
+    # Short-circuit: skip entirely once all batch elements have stopped thinking
+    if getattr(self.model, 'use_time_conditioning', False) and hasattr(self.model, 'time_progress_predictor'):
+        if is_thinking is None or any(is_thinking):
+            self.model._last_time_pred = self.model.time_progress_predictor(X.detach())
+            _new_hidden = X[:, -1:, :].detach()
+            _old_hidden = getattr(self.model, '_cached_last_hidden', None)
+            if is_thinking is not None and _old_hidden is not None and _old_hidden.shape == _new_hidden.shape:
+                _thinking_t = torch.tensor(is_thinking, device=X.device).view(-1, 1, 1)
+                self.model._cached_last_hidden = torch.where(_thinking_t, _new_hidden, _old_hidden)
+            else:
+                self.model._cached_last_hidden = _new_hidden
 
+    _used_tp = getattr(self.model, '_used_time_pred', torch.zeros(X.shape[0], 1, device=X.device))
     return BaseModelOutputWithPast(
         last_hidden_state = X,
         past_key_values = next_decoder_cache,
-        hidden_states = None if is_thinking is None else [thinking_embeds, is_thinking, embeds_ratio],
+        hidden_states = None if is_thinking is None else [thinking_embeds, is_thinking, embeds_ratio, _used_tp],
         attentions = [],
     )
 pass
@@ -2333,6 +2479,11 @@ class FastLlamaModel:
         # pass
 
         # Check modules_to_save
+        _TIME_COND_MODULES = frozenset((
+            "time_progress_predictor", "sinusoidal_time_embedding",
+            "adaln_proj",
+        ))
+        train_time_conditioning = False
         if modules_to_save is not None:
             for module in modules_to_save:
                 if module == "lm_head":
@@ -2341,10 +2492,12 @@ class FastLlamaModel:
                     train_embed_tokens = True
                 elif "thinking_residual" in module:
                     train_thinking_residual = True
+                elif module in _TIME_COND_MODULES:
+                    train_time_conditioning = True
                 else:
                     raise TypeError(
-                        f"Unsloth: Module = {module} is not allowed. Only 'lm_head', 'embed_tokens' "
-                        "and 'thinking_residual' components are allowed."
+                        f"Unsloth: Module = {module} is not allowed. Only 'lm_head', 'embed_tokens', "
+                        "'thinking_residual', and time conditioning components are allowed."
                     )
             pass
         pass
@@ -2476,6 +2629,25 @@ class FastLlamaModel:
                     model.model.model.thinking_residual_Lambda.modules_to_save.default\
                         .to(device = "cuda", dtype = torch.float32, non_blocking = True)
                     model.model.model.thinking_residual_Lambda.modules_to_save.default.requires_grad_(True)
+
+        if train_time_conditioning:
+            print("Unsloth: Training time conditioning modules in mixed precision to save VRAM")
+            try:
+                new_dtype = model.get_input_embeddings().weight.dtype
+            except:
+                new_dtype = model.get_input_embeddings().modules_to_save.default.weight.dtype
+
+            _inner = model.model.model  # PeftModel -> LoraModel -> CausalLM -> inner model
+            for mod_name in ("time_progress_predictor", "sinusoidal_time_embedding"):
+                mod = getattr(_inner, mod_name, None)
+                if mod is not None and hasattr(mod, "modules_to_save"):
+                    mod.modules_to_save.default.to(device="cuda", dtype=new_dtype, non_blocking=True)
+                    mod.modules_to_save.default.requires_grad_(True)
+            # Per-layer adaln_proj
+            for layer in _inner.layers:
+                if hasattr(layer, "adaln_proj") and hasattr(layer.adaln_proj, "modules_to_save"):
+                    layer.adaln_proj.modules_to_save.default.to(device="cuda", dtype=new_dtype, non_blocking=True)
+                    layer.adaln_proj.modules_to_save.default.requires_grad_(True)
 
         # Patch tokenizer to pad to the right
         internal_model = model

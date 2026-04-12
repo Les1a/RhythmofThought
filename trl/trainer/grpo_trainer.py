@@ -558,11 +558,15 @@ class GRPOTrainer(Trainer):
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
             completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            thinking_embeds = None
+            thinking_mask = None
+            embeds_ratio = None
+            rollout_time_pred = None
         else:
             # Regular generation path
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                prompt_completion_ids, thinking_embeds, thinking_mask, embeds_ratio = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, 
+                prompt_completion_ids, thinking_embeds, thinking_mask, embeds_ratio, rollout_time_pred = unwrapped_model.generate(
+                    prompt_ids, attention_mask=prompt_mask,
                     generation_config=self.generation_config,
                     processing_class=self.processing_class,
                     return_thinking_embeds=True,
@@ -691,6 +695,7 @@ class GRPOTrainer(Trainer):
             "thinking_embeds": thinking_embeds,
             "thinking_mask": thinking_mask,
             "embeds_ratio": embeds_ratio,
+            "rollout_time_pred": rollout_time_pred,
             "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
         }
@@ -706,7 +711,58 @@ class GRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        # Training-time AdaLN conditioning setup
+        _time_loss_w = getattr(self, 'time_loss_weight', 0)
+        _base = None
+        _gt_time_vals = None
+        _use_time_cond = False
+        thinking_mask = inputs.get("thinking_mask")
+        if _time_loss_w > 0 or thinking_mask is not None:
+            _unwrapped = self.accelerator.unwrap_model(model)
+            _base = _unwrapped.base_model.model.model if hasattr(_unwrapped, 'base_model') else _unwrapped.model
+            _use_time_cond = bool(
+                getattr(_base, 'use_time_conditioning', False) and hasattr(_base, 'sinusoidal_time_embedding')
+            )
+            _base._cached_last_hidden = None
+        if thinking_mask is not None and thinking_mask.shape[1] != input_ids.shape[1]:
+            if _use_time_cond or _time_loss_w > 0:
+                raise ValueError(
+                    f"time_conditioning: thinking_mask shape {thinking_mask.shape} does not match "
+                    f"input_ids shape {input_ids.shape}. This indicates a data pipeline bug."
+                )
+            thinking_mask = None
+        if _use_time_cond and _base is not None:
+            if thinking_mask is not None:
+                from time_conditioning import compute_gt_time, select_training_time_embedding
+                # Clone to escape inference-mode tensors from generation phase
+                _gt_time_vals = compute_gt_time(thinking_mask.clone())
+                _rollout_tp = inputs.get("rollout_time_pred")
+                _max_steps = getattr(self.state, "max_steps", 0) or 0
+                if _max_steps <= 0:
+                    _max_steps = getattr(self.args, "max_steps", 0)
+                _base._gt_time_emb, _pred_prob, _used_pred, _fallback_gt = select_training_time_embedding(
+                    _base,
+                    _gt_time_vals,
+                    _rollout_tp,
+                    global_step=self.state.global_step,
+                    max_steps=_max_steps,
+                )
+                _base._gt_time_mask = thinking_mask.clone()
+                self._metrics["time_cond_rollout_available"].append(float(_rollout_tp is not None))
+                self._metrics["time_cond_pred_prob"].append(_pred_prob)
+                self._metrics["time_cond_source_pred"].append(float(_used_pred))
+                self._metrics["time_cond_source_fallback_gt"].append(float(_fallback_gt))
+            else:
+                _base._gt_time_emb = None
+                _base._gt_time_mask = None
+
+        try:
+            per_token_logps = self._get_per_token_logps(model, input_ids, None, attention_mask, logits_to_keep)
+        finally:
+            # Clear GT time emb after forward (even on exception)
+            if _use_time_cond and _base is not None:
+                _base._gt_time_emb = None
+                _base._gt_time_mask = None
 
         # Compute the KL divergence between the model and the reference model
         ref_per_token_logps = inputs["ref_per_token_logps"]
@@ -717,6 +773,24 @@ class GRPOTrainer(Trainer):
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+        # Time predictor aux loss: MSE between predictor output and GT time
+        if _time_loss_w > 0 and _base is not None and _gt_time_vals is not None:
+            _time_pred = getattr(_base, '_last_time_pred', None)
+            if _time_pred is not None:
+                from time_conditioning import dead_zone_mse
+                _tm = thinking_mask.float()
+                _dz = dead_zone_mse(_time_pred, _gt_time_vals)
+                _per_sample = (_dz * _tm).sum(1) / _tm.sum(1).clamp(min=1)
+                _aux_loss = _per_sample.mean()
+                loss = loss + _time_loss_w * _aux_loss
+                self._metrics["time_pred_mse"].append(_aux_loss.detach().item())
+                # Log predictor output stats on thinking tokens
+                with torch.no_grad():
+                    _pred_masked = _time_pred[thinking_mask]
+                    if _pred_masked.numel() > 0:
+                        self._metrics["time_pred_mean"].append(_pred_masked.mean().item())
+                        self._metrics["time_pred_std"].append(_pred_masked.std().item())
 
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()

@@ -452,46 +452,108 @@ def grpo_trainer_compute_loss(function_name, function):
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         thinking_embeds, thinking_mask = inputs["thinking_embeds"], inputs["thinking_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+
+        # GT time conditioning setup for training
+        _time_loss_w = getattr(self, 'time_loss_weight', 0)
+        _base = None
+        _gt_time_vals = None
+        _use_time_cond = False
+        if _time_loss_w > 0 or thinking_mask is not None:
+            _unwrapped = self.accelerator.unwrap_model(model)
+            _base = _unwrapped.base_model.model.model if hasattr(_unwrapped, 'base_model') else _unwrapped.model
+            _use_time_cond = bool(
+                getattr(_base, 'use_time_conditioning', False) and hasattr(_base, 'sinusoidal_time_embedding')
+            )
+            _base._cached_last_hidden = None
+
         # When thinking is not active (e.g. only_grpo), thinking_mask only covers
         # prompt tokens and won't match the full input_ids length — disable it.
         if thinking_mask is not None and thinking_mask.shape[1] != input_ids.shape[1]:
+            if _use_time_cond or _time_loss_w > 0:
+                raise ValueError(
+                    f"time_conditioning: thinking_mask shape {thinking_mask.shape} does not match "
+                    f"input_ids shape {input_ids.shape}. This indicates a data pipeline bug."
+                )
             thinking_embeds = None
             thinking_mask = None
+
+        # Set time embeddings on base model before forward.
+        # AdaLN linearly anneals from GT time to rollout-predicted time.
+        # GT time is kept for the aux predictor loss below.
+        # Clone tensors to escape inference-mode from generation phase;
+        # gradient checkpointing (use_reentrant=True) cannot save inference tensors.
+        if _use_time_cond and _base is not None:
+            if thinking_mask is not None and thinking_mask.shape[1] == input_ids.shape[1]:
+                from time_conditioning import compute_gt_time, select_training_time_embedding
+                _gt_time_vals = compute_gt_time(thinking_mask.clone())
+                _rollout_tp = inputs.get("rollout_time_pred")
+                _max_steps = getattr(self.state, "max_steps", 0) or 0
+                if _max_steps <= 0:
+                    _max_steps = getattr(self.args, "max_steps", 0)
+                _base._gt_time_emb, _pred_prob, _used_pred, _fallback_gt = select_training_time_embedding(
+                    _base,
+                    _gt_time_vals,
+                    _rollout_tp,
+                    global_step=self.state.global_step,
+                    max_steps=_max_steps,
+                )
+                _base._gt_time_mask = thinking_mask.clone()
+                self._metrics["time_cond_rollout_available"].append(float(_rollout_tp is not None))
+                self._metrics["time_cond_pred_prob"].append(_pred_prob)
+                self._metrics["time_cond_source_pred"].append(float(_used_pred))
+                self._metrics["time_cond_source_fallback_gt"].append(float(_fallback_gt))
+            else:
+                _base._gt_time_emb = None
+                _base._gt_time_mask = None
+
         bsz, qlen = input_ids.shape
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        # attention_mask = None
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        logits_to_keep = completion_ids.size(1)
         _input_ids = input_ids
         _thinking_embeds = thinking_embeds
         _logits_to_keep = logits_to_keep
-        
-        per_token_logps = self._get_per_token_logps(model, input_ids, thinking_embeds, attention_mask, logits_to_keep)
 
-        # Compute the KL divergence between the model and the reference model
-        ref_per_token_logps = inputs["ref_per_token_logps"]
-        # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+        try:
+            per_token_logps = self._get_per_token_logps(model, input_ids, thinking_embeds, attention_mask, logits_to_keep)
 
-        # x - x.detach() allows for preserving gradients from x
-        advantages = inputs["advantages"]
-        # per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
-        # per_token_loss = -(per_token_loss - self.beta * per_token_kl)
-        # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-        input_ids = input_ids[:, -logits_to_keep:]
-        if per_token_logps is not None:
-            loss, completion_length, mean_kl = grpo_compute_loss_slow(
-                ref_per_token_logps, per_token_logps, input_ids, completion_mask, self.beta, advantages,
-            )
-        else:
-            loss, completion_length, mean_kl = grpo_accumulated_loss(
-                self, _input_ids, _thinking_embeds, thinking_mask, logits_to_keep, completion_mask, advantages,
-                n_chunks = self.args.unsloth_num_chunks,
-            )
+            # Compute the KL divergence between the model and the reference model
+            ref_per_token_logps = inputs["ref_per_token_logps"]
 
-        # Log the metrics
-        # completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+            # x - x.detach() allows for preserving gradients from x
+            advantages = inputs["advantages"]
+            input_ids = input_ids[:, -logits_to_keep:]
+            if per_token_logps is not None:
+                loss, completion_length, mean_kl = grpo_compute_loss_slow(
+                    ref_per_token_logps, per_token_logps, input_ids, completion_mask, self.beta, advantages,
+                )
+            else:
+                loss, completion_length, mean_kl = grpo_accumulated_loss(
+                    self, _input_ids, _thinking_embeds, thinking_mask, logits_to_keep, completion_mask, advantages,
+                    n_chunks = self.args.unsloth_num_chunks,
+                )
+        finally:
+            # Clear GT time emb after forward (even on exception)
+            if _use_time_cond and _base is not None:
+                _base._gt_time_emb = None
+                _base._gt_time_mask = None
 
-        # mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-        # self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        # Time predictor aux loss: MSE between predictor output and GT time
+        if _time_loss_w > 0 and _base is not None and _gt_time_vals is not None:
+            _time_pred = getattr(_base, '_last_time_pred', None)
+            if _time_pred is not None:
+                from time_conditioning import dead_zone_mse
+                _tm = thinking_mask.float()
+                _dz = dead_zone_mse(_time_pred, _gt_time_vals)
+                _per_sample = (_dz * _tm).sum(1) / _tm.sum(1).clamp(min=1)
+                _aux_loss = _per_sample.mean()
+                loss = loss + _time_loss_w * _aux_loss
+                self._metrics["time_pred_mse"].append(_aux_loss.detach().item())
+                # Log predictor output stats on thinking tokens
+                with torch.no_grad():
+                    _pred_masked = _time_pred[thinking_mask]
+                    if _pred_masked.numel() > 0:
+                        self._metrics["time_pred_mean"].append(_pred_masked.mean().item())
+                        self._metrics["time_pred_std"].append(_pred_masked.std().item())
 
         embeds_ratio = inputs["embeds_ratio"]
         embeds_ratio_mask = embeds_ratio < 1.

@@ -2,7 +2,7 @@ import types
 from transformers.trainer import *
 
 
-def patch_trainer_optimizer(trainer, lr_thinking_residual_gate=1e-4, thinking_residual_Lambda=1e-3):
+def patch_trainer_optimizer(trainer, lr_thinking_residual_gate=1e-4, thinking_residual_Lambda=1e-3, lr_time_conditioning=None):
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -14,17 +14,20 @@ def patch_trainer_optimizer(trainer, lr_thinking_residual_gate=1e-4, thinking_re
 
         if self.optimizer is None:
             decay_parameters = self.get_decay_parameter_names(opt_model)
+            _special = ("thinking_residual", "adaln_", "time_progress_predictor", "sinusoidal_time_embedding")
+            def _is_special(n):
+                return any(s in n for s in _special)
             optimizer_grouped_parameters = [
                 {
                     "params": [
-                        p for n, p in opt_model.named_parameters() if ("thinking_residual" not in n and n in decay_parameters and p.requires_grad)
+                        p for n, p in opt_model.named_parameters() if (not _is_special(n) and n in decay_parameters and p.requires_grad)
                     ],
                     "lr": self.args.learning_rate,
                     "weight_decay": self.args.weight_decay,
                 },
                 {
                     "params": [
-                        p for n, p in opt_model.named_parameters() if ("thinking_residual" not in n and n not in decay_parameters and p.requires_grad)
+                        p for n, p in opt_model.named_parameters() if (not _is_special(n) and n not in decay_parameters and p.requires_grad)
                     ],
                     "lr": self.args.learning_rate,
                     "weight_decay": 0.0,
@@ -44,6 +47,31 @@ def patch_trainer_optimizer(trainer, lr_thinking_residual_gate=1e-4, thinking_re
                     "weight_decay": self.args.weight_decay,
                 },
             ]
+
+            if lr_time_conditioning is not None:
+                _tc_names = ("sinusoidal_time_embedding", "adaln_proj", "time_progress_predictor")
+                optimizer_grouped_parameters.extend([
+                    {
+                        "params": [
+                            p for n, p in opt_model.named_parameters()
+                            if any(tc in n for tc in _tc_names)
+                            and n in decay_parameters
+                            and p.requires_grad
+                        ],
+                        "lr": lr_time_conditioning,
+                        "weight_decay": self.args.weight_decay,
+                    },
+                    {
+                        "params": [
+                            p for n, p in opt_model.named_parameters()
+                            if any(tc in n for tc in _tc_names)
+                            and n not in decay_parameters
+                            and p.requires_grad
+                        ],
+                        "lr": lr_time_conditioning,
+                        "weight_decay": 0.0,
+                    },
+                ])
 
             if self.optimizer_cls_and_kwargs is not None:
                 optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs
