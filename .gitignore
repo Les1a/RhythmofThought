@@ -4,6 +4,8 @@ logs/
 findings.md
 progress.md
 task_plan.md
+.codex
+/experiments
 
 *.pyc
 *.p
