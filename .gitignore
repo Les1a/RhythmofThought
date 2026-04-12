@@ -6,6 +6,7 @@ progress.md
 task_plan.md
 .codex
 /experiments
+tests/
 
 *.pyc
 *.p

@@ -7,7 +7,7 @@
 # MMLU, and RAG tasks with paper-official hyperparameters.
 #
 # This is equivalent to run_hrpo_all.sh --time-cond, but with time conditioning
-# hardcoded. Experiment dirs use an explicit `-thrpo-` marker plus `-tcond`.
+# hardcoded. Experiment dirs use the explicit `-thrpo-` mode marker only.
 #
 # Smart skipping — by default won't re-train if checkpoints exist, won't re-eval if
 # results exist. Pass --resume to continue training from the latest checkpoint
@@ -83,9 +83,6 @@ RESUME=false
 TIME_CONDITIONING=true       # Always enabled for THRPO
 TIME_LOSS_WEIGHT=0.1
 LR_TIME_CONDITIONING=1e-4
-
-PRETRAIN_TIME_SAMPLES=4096
-PRETRAIN_TIME_EPOCHS=2
 FAILED_TASKS=()
 
 # ========================= Argument Parsing ==================================
@@ -129,9 +126,7 @@ get_exp_name() {
     local task="$1"
     local group_size="$2"
     local model_short="${MODEL##*/}"
-    local name="./experiments/${model_short}-${task}-thrpo-group${group_size}-lora${LORA_RANK}-rmin${RESIDUAL_R_MIN}-temp${TEMPERATURE}"
-    [ "$TIME_CONDITIONING" = true ] && name="${name}-tcond"
-    echo "$name"
+    echo "./experiments/${model_short}-${task}-thrpo-group${group_size}-lora${LORA_RANK}-rmin${RESIDUAL_R_MIN}-temp${TEMPERATURE}"
 }
 
 find_latest_checkpoint() {
@@ -228,8 +223,7 @@ train_task() {
         echo "    --per_device_train_batch_size ${bs} --gradient_accumulation_steps ${ga} \\"
         echo "    --group_size ${group_size} --max_prompt_length ${max_prompt} --max_completion_length ${max_completion} \\"
         echo "    --model_name ${MODEL} --lora_rank ${LORA_RANK} --lr ${LR} --beta ${BETA} --temperature ${TEMPERATURE} --seed ${SEED}${resume_arg:+ ${resume_arg}} \\"
-        echo "    --time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING} \\"
-        echo "    --pretrain_time_samples ${PRETRAIN_TIME_SAMPLES} --pretrain_time_epochs ${PRETRAIN_TIME_EPOCHS}"
+        echo "    --time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}"
         return 0
     fi
 
@@ -257,7 +251,6 @@ train_task() {
         --temperature ${TEMPERATURE} \
         --seed ${SEED} \
         --time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING} \
-        --pretrain_time_samples ${PRETRAIN_TIME_SAMPLES} --pretrain_time_epochs ${PRETRAIN_TIME_EPOCHS} \
         2>&1 | tee "${logfile}"
 }
 
@@ -454,7 +447,7 @@ print_summary() {
     echo "Model:  ${MODEL}"
     echo "GPU:    ${GPU_ID}"
     echo "Tasks:  ${TASKS}"
-    echo "Time conditioning: weight=${TIME_LOSS_WEIGHT}, lr=${LR_TIME_CONDITIONING}, pretrain=${PRETRAIN_TIME_SAMPLES}x${PRETRAIN_TIME_EPOCHS}ep"
+    echo "Time conditioning: weight=${TIME_LOSS_WEIGHT}, lr=${LR_TIME_CONDITIONING}"
     echo ""
 
     for task in "${TASK_LIST[@]}"; do

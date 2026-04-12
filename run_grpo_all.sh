@@ -126,7 +126,7 @@ get_exp_name() {
     local group_size="$2"
     local model_short="${MODEL##*/}"
     if [ "$TIME_CONDITIONING" = true ]; then
-        echo "./experiments/${model_short}-${task}-tgrpo-group${group_size}-lora${LORA_RANK}-temp${TEMPERATURE}-tcond"
+        echo "./experiments/${model_short}-${task}-tgrpo-group${group_size}-lora${LORA_RANK}-temp${TEMPERATURE}"
     else
         echo "./experiments/${model_short}-${task}-grpo-group${group_size}-lora${LORA_RANK}-temp${TEMPERATURE}"
     fi
