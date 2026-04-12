@@ -11,23 +11,64 @@ import math
 import os
 import torch
 import torch.nn as nn
-from tqdm.auto import tqdm
+import torch.nn.functional as F
 
 
 class TimeProgressPredictor(nn.Module):
-    """Predicts per-token reasoning progress t ∈ [0,1] from input embeddings."""
+    """Predicts monotonic per-token reasoning progress t ∈ [0,1]."""
 
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, delta_eps=1e-6, init_bias=-4.0):
         super().__init__()
+        self.delta_eps = float(delta_eps)
         self.net = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 4),
             nn.SiLU(),
             nn.Linear(hidden_size // 4, 1),
         )
+        # Start near zero progress increments so early rollout predictions do not
+        # immediately saturate the time embedding.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.constant_(self.net[-1].bias, float(init_bias))
 
-    def forward(self, inputs_embeds):
+    def _delta_from_hidden(self, hidden_states):
+        return F.softplus(self.net(hidden_states)).squeeze(-1) + self.delta_eps
+
+    def forward(self, inputs_embeds, thinking_mask=None):
         # inputs_embeds: (B, L, hidden_size)
-        return torch.sigmoid(self.net(inputs_embeds)).squeeze(-1)  # (B, L)
+        delta = self._delta_from_hidden(inputs_embeds)
+        mask = None
+        if thinking_mask is not None:
+            mask = _normalize_sequence_mask(thinking_mask, delta.shape, delta.device)
+            delta = delta * mask.to(delta.dtype)
+        cum = torch.cumsum(delta, dim=1)
+        time = 1.0 - torch.exp(-cum)
+        if mask is not None:
+            time = time * mask.to(time.dtype)
+        return time  # (B, L)
+
+    def forward_step(self, inputs_embeds, prev_cum=None, is_thinking=None):
+        # inputs_embeds: (B, 1, hidden_size)
+        if inputs_embeds.ndim != 3 or inputs_embeds.shape[1] != 1:
+            raise ValueError(
+                "forward_step expects inputs_embeds with shape (B, 1, hidden_size), "
+                f"got {tuple(inputs_embeds.shape)}"
+            )
+        delta = self._delta_from_hidden(inputs_embeds)
+        if prev_cum is None:
+            prev_cum = torch.zeros_like(delta)
+        else:
+            if prev_cum.shape != delta.shape:
+                raise ValueError(
+                    f"prev_cum shape {tuple(prev_cum.shape)} does not match delta shape {tuple(delta.shape)}"
+                )
+            prev_cum = prev_cum.to(device=delta.device, dtype=delta.dtype)
+        mask = _normalize_step_mask(is_thinking, delta.shape[0], delta.device)
+        if mask is None:
+            mask = torch.ones_like(delta, dtype=torch.bool)
+        next_cum = torch.where(mask, prev_cum + delta, prev_cum)
+        time = 1.0 - torch.exp(-next_cum)
+        time = torch.where(mask, time, torch.zeros_like(time))
+        return time, next_cum
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -92,16 +133,11 @@ def compute_gt_time(thinking_mask):
 
     Returns:
         (B, N) float tensor. 0 for non-thinking positions,
-        linearly ramps from 0.0 to 1.0 across each sample's thinking span.
-        A single thinking token is treated as progress 0.0.
+        linearly ramps from 1 / n to 1.0 across each sample's thinking span.
     """
     mask_f = thinking_mask.float()
     lengths = mask_f.sum(dim=1, keepdim=True).clamp(min=1)
-    cumsum = mask_f.cumsum(dim=1)
-    # Shift cumsum so first thinking token is 0 and the last is 1.
-    # For a single-token span we intentionally keep t=0.0 to represent the
-    # degenerate start/end position without fabricating a terminal ramp.
-    ramp = (cumsum - mask_f) / (lengths - 1).clamp(min=1)
+    ramp = mask_f.cumsum(dim=1) / lengths
     return ramp.clamp(0, 1) * mask_f  # zero out non-thinking positions
 
 
@@ -111,12 +147,19 @@ def dead_zone_mse(pred, target, margin=0.01):
     return torch.where(error < margin, torch.zeros_like(error), (error - margin) ** 2)
 
 
-def select_training_time_embedding(base_model, gt_time_vals, rollout_time_pred, global_step, max_steps):
-    """Choose GT vs. predicted time for AdaLN during training.
+def select_training_time_embedding(
+    base_model,
+    gt_time_vals,
+    rollout_time_pred,
+    global_step,
+    max_steps,
+    thinking_mask=None,
+):
+    """Build mixed GT / rollout time embeddings for AdaLN during training.
 
-    The predicted-time probability linearly anneals from 0 at step 0 to 1 at
-    ``max_steps``. If the rollout prediction is unavailable, the helper falls
-    back to GT time while reporting that fallback to the caller.
+    The rollout mixing coefficient linearly anneals from 0 at step 0 to 1 at
+    ``max_steps``. Rollout predictions are detached, clamped to [0, 1], and
+    mixed only on thinking positions. Non-thinking positions remain zero.
 
     Args:
         base_model: Inner model that owns ``sinusoidal_time_embedding``.
@@ -126,7 +169,7 @@ def select_training_time_embedding(base_model, gt_time_vals, rollout_time_pred, 
         max_steps: Total optimization steps. If <= 0, always uses GT time.
 
     Returns:
-        Tuple ``(time_emb, pred_prob, used_pred, used_fallback_gt)`` where
+        Tuple ``(time_emb, mix_alpha, effective_rollout_alpha)`` where
         ``time_emb`` is ready for AdaLN consumption.
     """
     if gt_time_vals.ndim != 2:
@@ -134,10 +177,14 @@ def select_training_time_embedding(base_model, gt_time_vals, rollout_time_pred, 
     if not torch.isfinite(gt_time_vals).all():
         raise ValueError("gt_time_vals contains non-finite values")
 
-    pred_prob = 0.0
+    mix_alpha = 0.0
     if max_steps is not None and max_steps > 0:
-        pred_prob = float(global_step) / float(max_steps)
-        pred_prob = min(max(pred_prob, 0.0), 1.0)
+        mix_alpha = float(global_step) / float(max_steps)
+        mix_alpha = min(max(mix_alpha, 0.0), 1.0)
+
+    if thinking_mask is None:
+        thinking_mask = gt_time_vals > 0
+    thinking_mask = _normalize_sequence_mask(thinking_mask, gt_time_vals.shape, gt_time_vals.device)
 
     if rollout_time_pred is not None:
         if rollout_time_pred.shape != gt_time_vals.shape:
@@ -145,21 +192,120 @@ def select_training_time_embedding(base_model, gt_time_vals, rollout_time_pred, 
                 "rollout_time_pred shape does not match gt_time_vals: "
                 f"{tuple(rollout_time_pred.shape)} vs {tuple(gt_time_vals.shape)}"
             )
-        rollout_time_pred = rollout_time_pred.to(device=gt_time_vals.device, dtype=gt_time_vals.dtype)
+        rollout_time_pred = rollout_time_pred.to(device=gt_time_vals.device, dtype=gt_time_vals.dtype).detach()
         if not torch.isfinite(rollout_time_pred).all():
             raise ValueError("rollout_time_pred contains non-finite values")
         rollout_time_pred = rollout_time_pred.clamp(0.0, 1.0)
 
-    use_pred = False
-    used_fallback_gt = False
-    if rollout_time_pred is not None and pred_prob > 0.0:
-        use_pred = bool((torch.rand((), device=gt_time_vals.device) < pred_prob).item())
-    elif rollout_time_pred is None and pred_prob > 0.0:
-        used_fallback_gt = True
-
-    selected_time = rollout_time_pred if use_pred else gt_time_vals
+    selected_time = gt_time_vals
+    effective_rollout_alpha = 0.0
+    if rollout_time_pred is not None and mix_alpha > 0.0:
+        selected_time = (1.0 - mix_alpha) * gt_time_vals + mix_alpha * rollout_time_pred
+        effective_rollout_alpha = mix_alpha
+    selected_time = torch.where(thinking_mask, selected_time, torch.zeros_like(selected_time)).clamp(0.0, 1.0)
     time_emb = base_model.sinusoidal_time_embedding(selected_time.clone())
-    return time_emb, pred_prob, use_pred, used_fallback_gt
+    return time_emb, mix_alpha, effective_rollout_alpha
+
+
+def compute_time_aux_weights(rewards, floor=0.25):
+    """Convert rewards into dense auxiliary-loss weights."""
+    if rewards is None:
+        return None
+    if not torch.isfinite(rewards).all():
+        raise ValueError("rewards contains non-finite values")
+    floor = float(floor)
+    if floor < 0.0 or floor > 1.0:
+        raise ValueError(f"time_aux_weight_floor must be in [0, 1], got {floor}")
+    rewards = rewards.float()
+    r_min = rewards.min()
+    r_max = rewards.max()
+    if torch.isclose(r_max, r_min):
+        return torch.ones_like(rewards)
+    r_norm = (rewards - r_min) / (r_max - r_min)
+    return floor + (1.0 - floor) * r_norm
+
+
+def get_time_conditioning_base_model(model):
+    """Resolve the inner model that owns time-conditioning state."""
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model") and hasattr(model.base_model.model, "model"):
+        return model.base_model.model.model
+    if hasattr(model, "model"):
+        return model.model
+    return model
+
+
+def reset_time_conditioning_state(model, clear_last_time_pred=True):
+    """Clear cached time-conditioning state to avoid stale rollout leakage."""
+    if model is None:
+        return
+    attrs = (
+        "_gt_time_emb",
+        "_gt_time_mask",
+        "_cached_last_hidden",
+        "_used_time_pred",
+        "_time_progress_cum",
+    )
+    for attr in attrs:
+        setattr(model, attr, None)
+    if clear_last_time_pred:
+        model._last_time_pred = None
+
+
+def prepare_online_time_conditioning(base_model, batch_size, device, is_thinking=None):
+    """Build rollout-time embeddings from cached hidden state and cumulative progress."""
+    used_time_pred = torch.zeros(batch_size, 1, device=device)
+    time_emb = None
+    time_mask = _normalize_step_mask(is_thinking, batch_size, device)
+    cached_hidden = getattr(base_model, "_cached_last_hidden", None)
+    prev_cum = getattr(base_model, "_time_progress_cum", None)
+    if prev_cum is not None and prev_cum.shape != (batch_size, 1):
+        prev_cum = None
+        base_model._time_progress_cum = None
+    if cached_hidden is not None and cached_hidden.shape[:2] == (batch_size, 1):
+        with torch.no_grad():
+            used_time_pred, next_cum = base_model.time_progress_predictor.forward_step(
+                cached_hidden,
+                prev_cum=prev_cum,
+                is_thinking=is_thinking,
+            )
+            base_model._time_progress_cum = next_cum.detach()
+            time_emb = base_model.sinusoidal_time_embedding(used_time_pred)
+    base_model._used_time_pred = used_time_pred
+    return time_emb, time_mask, used_time_pred
+
+
+def update_online_time_conditioning_hidden_cache(base_model, new_hidden, is_thinking=None):
+    """Update the one-step-lag hidden cache, freezing stopped samples."""
+    old_hidden = getattr(base_model, "_cached_last_hidden", None)
+    mask = _normalize_step_mask(is_thinking, new_hidden.shape[0], new_hidden.device)
+    if mask is not None and old_hidden is not None and old_hidden.shape == new_hidden.shape:
+        base_model._cached_last_hidden = torch.where(mask.unsqueeze(-1), new_hidden, old_hidden)
+    else:
+        base_model._cached_last_hidden = new_hidden
+
+
+def _normalize_sequence_mask(thinking_mask, target_shape, device):
+    mask = thinking_mask
+    if not torch.is_tensor(mask):
+        mask = torch.tensor(mask, device=device)
+    mask = mask.to(device=device, dtype=torch.bool)
+    if mask.shape != target_shape:
+        raise ValueError(f"thinking_mask shape {tuple(mask.shape)} does not match target shape {tuple(target_shape)}")
+    return mask
+
+
+def _normalize_step_mask(is_thinking, batch_size, device):
+    if is_thinking is None:
+        return None
+    mask = is_thinking
+    if not torch.is_tensor(mask):
+        mask = torch.tensor(mask, device=device)
+    mask = mask.to(device=device, dtype=torch.bool)
+    if mask.dim() == 1:
+        mask = mask.unsqueeze(1)
+    if mask.shape != (batch_size, 1):
+        raise ValueError(f"is_thinking shape {tuple(mask.shape)} does not match expected {(batch_size, 1)}")
+    return mask
 
 
 def enable_time_conditioning(model):
@@ -172,7 +318,7 @@ def enable_time_conditioning(model):
     Args:
         model: The top-level CausalLM (e.g. from FastLanguageModel.from_pretrained).
     """
-    inner = model.model  # CausalLM.model → inner model (LlamaModel / Qwen2Model)
+    inner = get_time_conditioning_base_model(model)
     config = inner.config
     _te_dim = getattr(config, 'time_embed_dim', 256)
     device = next(inner.parameters()).device
@@ -195,6 +341,7 @@ def enable_time_conditioning(model):
             time_embed_dim=_te_dim
         ).to(device=device, dtype=dtype)
     inner.use_time_conditioning = True
+    reset_time_conditioning_state(inner)
 
 
 def detect_time_conditioning(model, adapter_path):
@@ -214,217 +361,6 @@ def detect_time_conditioning(model, adapter_path):
     if os.path.exists(cfg_path):
         with open(cfg_path) as f:
             acfg = json.load(f)
-        if 'adaln_proj' in acfg.get('modules_to_save', []):
+        modules_to_save = acfg.get('modules_to_save') or []
+        if 'adaln_proj' in modules_to_save:
             enable_time_conditioning(model)
-
-
-def pretrain_time_predictor(model, tokenizer, dataset, num_samples=1024,
-                            num_epochs=3, lr=1e-4, temperature=0.5,
-                            max_completion_length=1024, batch_size=128):
-    """Phase 0: Pre-train TimeProgressPredictor before main GRPO training.
-
-    Generates completions for a subset of training data, builds thinking masks
-    from the ``####`` answer marker, then trains the predictor to map final
-    hidden states to a linear time ramp [0, 1] across thinking tokens.
-
-    Only the predictor is updated; all other model parameters are frozen.
-
-    Args:
-        model: PEFT-wrapped CausalLM with time conditioning enabled.
-        tokenizer: Tokenizer / processing class.
-        dataset: Training dataset (must have a ``prompt`` column).
-        num_samples: Number of prompts to generate completions for.
-        num_epochs: Supervised training epochs over the generated data.
-        lr: Learning rate for the predictor optimizer.
-        temperature: Sampling temperature for completion generation.
-        max_completion_length: Maximum new tokens per generation.
-        batch_size: Batch size for both generation and training.
-    """
-    from transformers import GenerationConfig
-
-    device = next(model.parameters()).device
-
-    # Resolve inner model (Qwen2Model / LlamaModel)
-    if hasattr(model, 'base_model'):
-        inner = model.base_model.model.model
-    else:
-        inner = model.model
-
-    n = min(num_samples, len(dataset))
-    print(f"[Phase 0] Generating {n} completions for time predictor pre-training...")
-
-    # ---- Generation phase ----
-    gen_config = GenerationConfig(
-        max_new_tokens=max_completion_length,
-        do_sample=True,
-        temperature=temperature,
-        top_p=0.95,
-    )
-
-    model.eval()
-    # Reset any stale state from prior .generate() calls so the first
-    # batch's forward takes the fresh predictor-free path.
-    inner._gt_time_emb = None
-    inner._gt_time_mask = None
-    inner._cached_last_hidden = None
-    inner._last_time_pred = None
-
-    all_full_ids = []
-    all_thinking_masks = []
-    all_attention_masks = []
-
-    with tqdm(total=n, desc="[Phase 0 inference]", unit="completions") as pbar:
-        for i in range(0, n, batch_size):
-            end = min(i + batch_size, n)
-            batch_prompts = dataset[i:end]["prompt"]
-            prompts_text = [
-                tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
-                for p in batch_prompts
-            ]
-            inputs = tokenizer(
-                prompts_text, return_tensors="pt", padding=True,
-                padding_side="left", add_special_tokens=False,
-            )
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-
-            with torch.no_grad():
-                gen_out = model.generate(
-                    inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    generation_config=gen_config,
-                    processing_class=tokenizer,
-                    return_thinking_embeds=True,
-                )
-                # gen_out is a 5-tuple: (input_ids, thinking_embeds, thinking_mask,
-                # embeds_ratio, time_preds). Only grab what we actually use; drop
-                # the rest via `del gen_out` to free (B, L, D) tensors early.
-                full_ids = gen_out[0]
-                thinking_mask = gen_out[2]
-                del gen_out
-
-            pbar.update(end - i)
-
-            # Skip batches with zero thinking tokens
-            if thinking_mask.sum() == 0:
-                del full_ids, thinking_mask, inputs
-                torch.cuda.empty_cache()
-                continue
-
-            attn_mask = (full_ids != tokenizer.pad_token_id).long()
-            all_full_ids.append(full_ids.cpu())
-            all_thinking_masks.append(thinking_mask.cpu())
-            all_attention_masks.append(attn_mask.cpu())
-
-            # Free per-batch GPU tensors before the next iteration.
-            del full_ids, thinking_mask, attn_mask, inputs
-            torch.cuda.empty_cache()
-
-            print(f"  [Phase 0 inference] Generated {end}/{n} completions")
-
-    if not all_full_ids:
-        print("[Phase 0] No thinking tokens found in any completion — skipping pre-training.")
-        model.train()
-        return
-
-    # Free generation-phase GPU buffers before training phase
-    import gc
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # ---- Training phase ----
-    print(f"[Phase 0] Training time predictor for {num_epochs} epochs "
-          f"on {len(all_full_ids)} batches...")
-
-    # Freeze everything except TimeProgressPredictor
-    saved_grad = {}
-    predictor_params = []
-    for name, param in model.named_parameters():
-        saved_grad[name] = param.requires_grad
-        if "time_progress_predictor" in name:
-            param.requires_grad_(True)
-            predictor_params.append(param)
-        else:
-            param.requires_grad_(False)
-
-    optimizer = torch.optim.AdamW(predictor_params, lr=lr)
-    # Keep the model in evaluation mode for the whole training phase:
-    # - disables gradient checkpointing (unsloth/llama.py:838)
-    # - keeps attention_mask 4D-prepared for variable-length padded batches
-    #   (unsloth/llama.py:764-783 would zero it out under self.training=True)
-    # - the predictor has no dropout/batchnorm, so evaluation mode doesn't
-    #   change its output
-    model.train(False)
-    predictor = inner.time_progress_predictor
-
-    for epoch in range(num_epochs):
-        total_loss = 0.0
-        num_batches = 0
-        indices = torch.randperm(len(all_full_ids))
-
-        for idx in indices:
-            full_ids = all_full_ids[idx].to(device, non_blocking=True)
-            t_mask = all_thinking_masks[idx].to(device, non_blocking=True)
-            attn_mask = all_attention_masks[idx].to(device, non_blocking=True)
-
-            if t_mask.sum() == 0:
-                continue
-
-            # Force the backbone into its unmodulated predictor-free path.
-            # modeling_qwen2.py:639-660 / unsloth/llama.py:791-809 gate
-            # time_emb on these attrs — all None means time_emb stays None.
-            inner._gt_time_emb = None
-            inner._gt_time_mask = None
-            inner._cached_last_hidden = None
-
-            # Step 1: backbone under no_grad to get last hidden states.
-            # Calling `inner` directly (not `model`) skips the LM head entirely.
-            # Gradient-wise this is numerically identical to the old path
-            # because modeling_qwen2.py:716 / unsloth/llama.py:987 feeds
-            # hidden_states.detach() into the predictor — the backbone was
-            # never in the predictor's gradient graph. Under the outer
-            # no_grad the internal predictor call at line 987 builds no
-            # graph; we re-invoke the predictor explicitly below for grads.
-            with torch.no_grad():
-                out = inner(
-                    input_ids=full_ids,
-                    attention_mask=attn_mask,
-                    use_cache=False,
-                    output_hidden_states=False,
-                )
-                hidden_states = out.last_hidden_state  # (B, L, D), no grad
-
-            # Step 2: run only the predictor with grads enabled.
-            optimizer.zero_grad(set_to_none=True)
-            pred_time = predictor(hidden_states)  # (B, L)
-
-            gt_time = compute_gt_time(t_mask).to(pred_time.device, pred_time.dtype)
-            tm = t_mask.float()
-            dz = dead_zone_mse(pred_time, gt_time)
-            loss = (dz * tm).sum() / tm.sum().clamp(min=1)
-
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            num_batches += 1
-
-            del full_ids, t_mask, attn_mask, hidden_states, pred_time, out
-
-        avg = total_loss / max(num_batches, 1)
-        print(f"  Epoch {epoch + 1}/{num_epochs}: time_pred_mse = {avg:.6f}")
-
-    # Restore requires_grad
-    for name, param in model.named_parameters():
-        param.requires_grad_(saved_grad.get(name, True))
-
-    # Cleanup
-    inner._gt_time_emb = None
-    inner._gt_time_mask = None
-    inner._cached_last_hidden = None
-    inner._last_time_pred = None
-    del all_full_ids, all_thinking_masks, all_attention_masks
-    import gc as _gc; _gc.collect()
-    torch.cuda.empty_cache()
-
-    model.train()
-    print("[Phase 0] Time predictor pre-training complete.")

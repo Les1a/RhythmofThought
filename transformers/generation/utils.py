@@ -3283,6 +3283,11 @@ class GenerationMixin:
                 os.environ["TOKENIZERS_PARALLELISM"] = "0"
                 model_forward = self.get_compiled_call(generation_config.compile_config)
 
+        from time_conditioning import get_time_conditioning_base_model, reset_time_conditioning_state
+        _tc_base = get_time_conditioning_base_model(self)
+        if getattr(_tc_base, "use_time_conditioning", False) and hasattr(_tc_base, "time_progress_predictor"):
+            reset_time_conditioning_state(_tc_base)
+
         is_prefill = True
         is_thinking, last_thinking_states = None, None
         thinking_embeds = [self.get_input_embeddings()(input_ids)] if return_thinking_embeds else []

@@ -796,17 +796,13 @@ def LlamaModel_fast_forward(
             _time_mask = getattr(self, '_gt_time_mask', None)
         else:
             # Predictor mode (rollout/inference)
-            _cached = getattr(self, '_cached_last_hidden', None)
-            if _cached is not None and _cached.shape[0] == inputs_embeds.shape[0]:
-                with torch.no_grad():
-                    _t_cached = self.time_progress_predictor(_cached)
-                    _time_emb = self.sinusoidal_time_embedding(_t_cached)
-            # Gate by is_thinking in predictor mode (match standard path)
-            _is_thinking = kwargs.get('is_thinking', None)
-            if _is_thinking is not None and _time_emb is not None:
-                _time_mask = torch.tensor(_is_thinking, dtype=torch.bool, device=inputs_embeds.device)
-                if _time_mask.dim() == 1:
-                    _time_mask = _time_mask.unsqueeze(1)
+            from time_conditioning import prepare_online_time_conditioning
+            _time_emb, _time_mask, _ = prepare_online_time_conditioning(
+                self,
+                inputs_embeds.shape[0],
+                inputs_embeds.device,
+                kwargs.get('is_thinking', None),
+            )
 
     if IS_GRANITE: #granite has embedding multiplier
         hidden_states = self.embedding_multiplier * hidden_states
@@ -976,17 +972,16 @@ def LlamaModel_fast_forward(
     pass
     # Time conditioning: always run predictor (aux loss during training, cache during rollout)
     if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
-        self._last_time_pred = self.time_progress_predictor(hidden_states.detach())
+        _predict_mask = getattr(self, '_gt_time_mask', None)
+        if _predict_mask is not None:
+            self._last_time_pred = self.time_progress_predictor(hidden_states.detach(), thinking_mask=_predict_mask)
+        else:
+            self._last_time_pred = self.time_progress_predictor(hidden_states.detach())
         if getattr(self, '_gt_time_emb', None) is None:
             # Rollout/inference: cache hidden state for next decode step (only thinking positions)
+            from time_conditioning import update_online_time_conditioning_hidden_cache
             _new_hidden = hidden_states[:, -1:, :].detach()
-            _is_thinking = kwargs.get('is_thinking', None)
-            _old_hidden = getattr(self, '_cached_last_hidden', None)
-            if _is_thinking is not None and _old_hidden is not None and _old_hidden.shape == _new_hidden.shape:
-                _thinking_t = torch.tensor(_is_thinking, device=hidden_states.device).view(-1, 1, 1)
-                self._cached_last_hidden = torch.where(_thinking_t, _new_hidden, _old_hidden)
-            else:
-                self._cached_last_hidden = _new_hidden
+            update_online_time_conditioning_hidden_cache(self, _new_hidden, kwargs.get('is_thinking', None))
 
     if output_hidden_states: all_hidden_states += (hidden_states,)
     next_cache = next_decoder_cache if use_cache else None
@@ -1025,14 +1020,13 @@ def LlamaModel_fast_forward_inference(
     is_thinking = kwargs.get('is_thinking')
     if getattr(self.model, 'use_time_conditioning', False) and hasattr(self.model, 'time_progress_predictor'):
         if is_thinking is None or any(is_thinking):
-            _cached = getattr(self.model, '_cached_last_hidden', None)
-            if _cached is not None and _cached.shape[0] == X.shape[0]:
-                with torch.no_grad():
-                    _t_cached = self.model.time_progress_predictor(_cached)
-                    self.model._used_time_pred = _t_cached  # store time used for AdaLN
-                    _time_emb_inf = self.model.sinusoidal_time_embedding(_t_cached)
-            else:
-                self.model._used_time_pred = torch.zeros(X.shape[0], 1, device=X.device)
+            from time_conditioning import prepare_online_time_conditioning
+            _time_emb_inf, _, _ = prepare_online_time_conditioning(
+                self.model,
+                X.shape[0],
+                X.device,
+                is_thinking,
+            )
         else:
             # All thinking stopped: zero out so stale predictions are not collected
             self.model._used_time_pred = torch.zeros(X.shape[0], 1, device=X.device)
@@ -1157,13 +1151,9 @@ def LlamaModel_fast_forward_inference(
     if getattr(self.model, 'use_time_conditioning', False) and hasattr(self.model, 'time_progress_predictor'):
         if is_thinking is None or any(is_thinking):
             self.model._last_time_pred = self.model.time_progress_predictor(X.detach())
+            from time_conditioning import update_online_time_conditioning_hidden_cache
             _new_hidden = X[:, -1:, :].detach()
-            _old_hidden = getattr(self.model, '_cached_last_hidden', None)
-            if is_thinking is not None and _old_hidden is not None and _old_hidden.shape == _new_hidden.shape:
-                _thinking_t = torch.tensor(is_thinking, device=X.device).view(-1, 1, 1)
-                self.model._cached_last_hidden = torch.where(_thinking_t, _new_hidden, _old_hidden)
-            else:
-                self.model._cached_last_hidden = _new_hidden
+            update_online_time_conditioning_hidden_cache(self.model, _new_hidden, is_thinking)
 
     _used_tp = getattr(self.model, '_used_time_pred', torch.zeros(X.shape[0], 1, device=X.device))
     return BaseModelOutputWithPast(

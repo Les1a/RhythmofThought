@@ -464,7 +464,8 @@ def grpo_trainer_compute_loss(function_name, function):
             _use_time_cond = bool(
                 getattr(_base, 'use_time_conditioning', False) and hasattr(_base, 'sinusoidal_time_embedding')
             )
-            _base._cached_last_hidden = None
+            from time_conditioning import reset_time_conditioning_state
+            reset_time_conditioning_state(_base)
 
         # When thinking is not active (e.g. only_grpo), thinking_mask only covers
         # prompt tokens and won't match the full input_ids length — disable it.
@@ -490,18 +491,18 @@ def grpo_trainer_compute_loss(function_name, function):
                 _max_steps = getattr(self.state, "max_steps", 0) or 0
                 if _max_steps <= 0:
                     _max_steps = getattr(self.args, "max_steps", 0)
-                _base._gt_time_emb, _pred_prob, _used_pred, _fallback_gt = select_training_time_embedding(
+                _base._gt_time_emb, _pred_prob, _effective_rollout_alpha = select_training_time_embedding(
                     _base,
                     _gt_time_vals,
                     _rollout_tp,
                     global_step=self.state.global_step,
                     max_steps=_max_steps,
+                    thinking_mask=thinking_mask.clone(),
                 )
                 _base._gt_time_mask = thinking_mask.clone()
                 self._metrics["time_cond_rollout_available"].append(float(_rollout_tp is not None))
-                self._metrics["time_cond_pred_prob"].append(_pred_prob)
-                self._metrics["time_cond_source_pred"].append(float(_used_pred))
-                self._metrics["time_cond_source_fallback_gt"].append(float(_fallback_gt))
+                self._metrics["time_cond_mix_alpha"].append(_pred_prob)
+                self._metrics["time_cond_rollout_effective_alpha"].append(_effective_rollout_alpha)
             else:
                 _base._gt_time_emb = None
                 _base._gt_time_mask = None
@@ -541,32 +542,33 @@ def grpo_trainer_compute_loss(function_name, function):
         if _time_loss_w > 0 and _base is not None and _gt_time_vals is not None:
             _time_pred = getattr(_base, '_last_time_pred', None)
             if _time_pred is not None:
-                from time_conditioning import dead_zone_mse
+                from time_conditioning import compute_time_aux_weights, dead_zone_mse
                 _tm = thinking_mask.float()
                 _dz = dead_zone_mse(_time_pred, _gt_time_vals)
                 _per_sample = (_dz * _tm).sum(1) / _tm.sum(1).clamp(min=1)
                 _rewards = inputs.get("rewards")
+                _aux_weight_floor = getattr(self, "time_aux_weight_floor", 0.25)
                 if _rewards is not None:
-                    _reward_mask = (_rewards > 0).to(_per_sample.dtype)
-                    _aux_loss = (_per_sample * _reward_mask).sum() / _reward_mask.sum().clamp(min=1)
+                    _aux_weights = compute_time_aux_weights(_rewards, floor=_aux_weight_floor)
                 else:
-                    _aux_loss = _per_sample.mean()
+                    _aux_weights = torch.ones_like(_per_sample)
+                _aux_weights = _aux_weights.to(device=_per_sample.device, dtype=_per_sample.dtype)
+                _aux_loss = (_per_sample * _aux_weights).mean()
                 loss = loss + _time_loss_w * _aux_loss
                 self._metrics["time_pred_mse"].append(_aux_loss.detach().item())
+                self._metrics["time_aux_weight_mean"].append(_aux_weights.mean().item())
+                self._metrics["time_aux_weight_min"].append(_aux_weights.min().item())
+                self._metrics["time_aux_weight_max"].append(_aux_weights.max().item())
                 # Log predictor output stats on thinking tokens
                 with torch.no_grad():
                     _pred_thinking = _time_pred[thinking_mask]
-                    if _rewards is not None:
-                        _reward_mask_bool = (_rewards > 0)
-                        if _reward_mask_bool.any():
-                            _pred_masked = _time_pred[_reward_mask_bool.unsqueeze(1) & thinking_mask]
-                        else:
-                            _pred_masked = _pred_thinking.new_empty((0,))
-                    else:
-                        _pred_masked = _pred_thinking
-                    if _pred_masked.numel() > 0:
-                        self._metrics["time_pred_mean"].append(_pred_masked.mean().item())
-                        self._metrics["time_pred_std"].append(_pred_masked.std(unbiased=False).item())
+                    if _pred_thinking.numel() > 0:
+                        self._metrics["time_pred_mean"].append(_pred_thinking.mean().item())
+                        self._metrics["time_pred_std"].append(_pred_thinking.std(unbiased=False).item())
+
+        if _use_time_cond and _base is not None:
+            from time_conditioning import reset_time_conditioning_state
+            reset_time_conditioning_state(_base)
 
         embeds_ratio = inputs["embeds_ratio"]
         embeds_ratio_mask = embeds_ratio < 1.

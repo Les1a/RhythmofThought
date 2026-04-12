@@ -55,8 +55,6 @@ def main(args):
     else:
         exp_name = (f"./experiments/{args.model_name.split('/')[-1]}-math-hrpo-group{args.group_size}"
                     f"-lora{args.lora_rank}-rmin{args.residual_r_min}-temp{args.temperature}")
-    if is_thrpo:
-        exp_name += "-tcond"
     resume_from_checkpoint = None
     if args.resume:
         if not os.path.exists(exp_name):
@@ -160,25 +158,13 @@ def main(args):
     )
     if is_tgrpo or is_thrpo:
         trainer.time_loss_weight = args.time_loss_weight
+        trainer.time_aux_weight_floor = args.time_aux_weight_floor
     if not is_grpo:
         patch_trainer_optimizer(
             trainer,
             lr_thinking_residual_gate=None if is_tgrpo else args.lr_residual_gate,
             thinking_residual_Lambda=None if is_tgrpo else args.lr_residual_Lambda,
             lr_time_conditioning=args.lr_time_conditioning if (is_tgrpo or is_thrpo) else None,
-        )
-    if (is_thrpo
-            and resume_from_checkpoint is None and args.pretrain_time_predicator):
-        from time_conditioning import pretrain_time_predictor
-        print("Pretraining time predictor...")
-        pretrain_time_predictor(
-            model, tokenizer, dataset,
-            num_samples=args.pretrain_time_samples,
-            num_epochs=args.pretrain_time_epochs,
-            lr=args.lr_time_conditioning,
-            temperature=args.temperature,
-            max_completion_length=args.max_completion_length,
-            batch_size=128,
         )
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
@@ -211,10 +197,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--time_conditioning", action="store_true", default=False)
     parser.add_argument("--time_loss_weight", type=float, default=0.1)
+    parser.add_argument("--time_aux_weight_floor", type=float, default=0.25)
     parser.add_argument("--lr_time_conditioning", type=float, default=1e-4)
-    parser.add_argument("--pretrain-time-predicator", action="store_true", default=False)
-    parser.add_argument("--pretrain_time_samples", type=int, default=1024)
-    parser.add_argument("--pretrain_time_epochs", type=int, default=3)
     parser.add_argument("--only_grpo", action="store_true", default=False)
     parser.add_argument("--tgrpo", action="store_true", default=False)
     parser.add_argument("--resume", action="store_true", default=False)

@@ -634,7 +634,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # Time conditioning: dual mode (GT for training, predictor for rollout/inference)
         time_emb = None
         time_mask = None
-        _is_thinking_t = None  # cached tensor for is_thinking (avoid repeated creation)
+        _is_thinking = flash_attn_kwargs.get('is_thinking', None)
         if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
             _gt = getattr(self, '_gt_time_emb', None)
             if _gt is not None:
@@ -643,19 +643,13 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 time_mask = getattr(self, '_gt_time_mask', None)
             else:
                 # Predictor mode (rollout/inference): use cached hidden state
-                _cached = getattr(self, '_cached_last_hidden', None)
-                if _cached is not None and _cached.shape[0] == inputs_embeds.shape[0]:
-                    with torch.no_grad():
-                        _t_cached = self.time_progress_predictor(_cached)
-                        time_emb = self.sinusoidal_time_embedding(_t_cached)
-                # Gate by is_thinking in predictor mode
-                _is_thinking = flash_attn_kwargs.get('is_thinking', None)
-                if _is_thinking is not None:
-                    _is_thinking_t = torch.tensor(_is_thinking, device=inputs_embeds.device)
-                    if time_emb is not None:
-                        time_mask = _is_thinking_t.to(dtype=torch.bool)
-                        if time_mask.dim() == 1:
-                            time_mask = time_mask.unsqueeze(1)
+                from time_conditioning import prepare_online_time_conditioning
+                time_emb, time_mask, _ = prepare_online_time_conditioning(
+                    self,
+                    inputs_embeds.shape[0],
+                    inputs_embeds.device,
+                    _is_thinking,
+                )
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -705,15 +699,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
         hidden_states = self.norm(hidden_states)
         # Time conditioning: always run predictor (aux loss during training, cache during rollout)
         if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
-            self._last_time_pred = self.time_progress_predictor(hidden_states.detach())
+            _predict_mask = getattr(self, '_gt_time_mask', None)
+            if _predict_mask is not None:
+                self._last_time_pred = self.time_progress_predictor(hidden_states.detach(), thinking_mask=_predict_mask)
+            else:
+                self._last_time_pred = self.time_progress_predictor(hidden_states.detach())
             if getattr(self, '_gt_time_emb', None) is None:
                 # Rollout/inference: cache hidden state for next decode step (only thinking positions)
+                from time_conditioning import update_online_time_conditioning_hidden_cache
                 _new_hidden = hidden_states[:, -1:, :].detach()
-                _old_hidden = getattr(self, '_cached_last_hidden', None)
-                if _is_thinking_t is not None and _old_hidden is not None and _old_hidden.shape == _new_hidden.shape:
-                    self._cached_last_hidden = torch.where(_is_thinking_t.view(-1, 1, 1), _new_hidden, _old_hidden)
-                else:
-                    self._cached_last_hidden = _new_hidden
+                update_online_time_conditioning_hidden_cache(self, _new_hidden, _is_thinking)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
