@@ -565,12 +565,23 @@ class GRPOTrainer(Trainer):
         else:
             # Regular generation path
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
-                prompt_completion_ids, thinking_embeds, thinking_mask, embeds_ratio, rollout_time_pred = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask,
+                generate_outputs = unwrapped_model.generate(
+                    prompt_ids,
+                    attention_mask=prompt_mask,
                     generation_config=self.generation_config,
                     processing_class=self.processing_class,
                     return_thinking_embeds=True,
                 )
+                if len(generate_outputs) == 4:
+                    prompt_completion_ids, thinking_embeds, thinking_mask, embeds_ratio = generate_outputs
+                    rollout_time_pred = None
+                elif len(generate_outputs) == 5:
+                    prompt_completion_ids, thinking_embeds, thinking_mask, embeds_ratio, rollout_time_pred = generate_outputs
+                else:
+                    raise ValueError(
+                        "Unexpected generate() return arity for GRPO rollout: "
+                        f"{len(generate_outputs)}"
+                    )
 
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)

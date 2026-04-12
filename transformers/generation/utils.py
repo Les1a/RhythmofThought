@@ -3285,7 +3285,12 @@ class GenerationMixin:
 
         from time_conditioning import get_time_conditioning_base_model, reset_time_conditioning_state
         _tc_base = get_time_conditioning_base_model(self)
-        if getattr(_tc_base, "use_time_conditioning", False) and hasattr(_tc_base, "time_progress_predictor"):
+        _tc_enabled = bool(
+            getattr(_tc_base, "use_time_conditioning", False)
+            and hasattr(_tc_base, "time_progress_predictor")
+        )
+
+        if _tc_enabled:
             reset_time_conditioning_state(_tc_base)
 
         is_prefill = True
@@ -3299,7 +3304,7 @@ class GenerationMixin:
         ] if return_thinking_embeds else []
         time_preds = [
             torch.zeros(input_ids.shape[0], input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
-        ] if return_thinking_embeds else []
+        ] if (return_thinking_embeds and _tc_enabled) else []
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
@@ -3389,9 +3394,9 @@ class GenerationMixin:
                 embeds_ratio.append(
                     torch.tensor(outputs.hidden_states[2], device=input_ids.device).unsqueeze(1)
                 )
-                if len(outputs.hidden_states) > 3 and outputs.hidden_states[3] is not None:
+                if _tc_enabled and len(outputs.hidden_states) > 3 and outputs.hidden_states[3] is not None:
                     time_preds.append(outputs.hidden_states[3])
-                else:
+                elif _tc_enabled:
                     time_preds.append(torch.zeros(input_ids.shape[0], 1, dtype=torch.float32, device=input_ids.device))
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
@@ -3436,10 +3441,23 @@ class GenerationMixin:
                 embeds_ratio.append(
                     torch.ones_like(input_ids[:, -1:], dtype=torch.float32, device=input_ids.device)
                 )
-                # Carry the last available rollout prediction forward to the
-                # final generated token instead of fabricating a trailing zero.
-                time_preds.append(time_preds[-1][:, -1:].clone())
-                return input_ids, torch.cat(thinking_embeds, dim=1), torch.cat(thinking_mask, dim=1), torch.cat(embeds_ratio, dim=1), torch.cat(time_preds, dim=1)
+                if _tc_enabled:
+                    # Carry the last available rollout prediction forward to the
+                    # final generated token instead of fabricating a trailing zero.
+                    time_preds.append(time_preds[-1][:, -1:].clone())
+                    return (
+                        input_ids,
+                        torch.cat(thinking_embeds, dim=1),
+                        torch.cat(thinking_mask, dim=1),
+                        torch.cat(embeds_ratio, dim=1),
+                        torch.cat(time_preds, dim=1),
+                    )
+                return (
+                    input_ids,
+                    torch.cat(thinking_embeds, dim=1),
+                    torch.cat(thinking_mask, dim=1),
+                    torch.cat(embeds_ratio, dim=1),
+                )
             else:
                 return input_ids
 

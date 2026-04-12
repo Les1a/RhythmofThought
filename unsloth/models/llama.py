@@ -1155,11 +1155,19 @@ def LlamaModel_fast_forward_inference(
             _new_hidden = X[:, -1:, :].detach()
             update_online_time_conditioning_hidden_cache(self.model, _new_hidden, is_thinking)
 
+    _tc_enabled = bool(
+        getattr(self.model, 'use_time_conditioning', False)
+        and hasattr(self.model, 'time_progress_predictor')
+    )
     _used_tp = getattr(self.model, '_used_time_pred', torch.zeros(X.shape[0], 1, device=X.device))
+    _hidden_states = None
+    if is_thinking is not None:
+        _hidden_states = [thinking_embeds, is_thinking, embeds_ratio, _used_tp] if _tc_enabled \
+            else [thinking_embeds, is_thinking, embeds_ratio]
     return BaseModelOutputWithPast(
         last_hidden_state = X,
         past_key_values = next_decoder_cache,
-        hidden_states = None if is_thinking is None else [thinking_embeds, is_thinking, embeds_ratio, _used_tp],
+        hidden_states = _hidden_states,
         attentions = [],
     )
 pass
