@@ -545,15 +545,28 @@ def grpo_trainer_compute_loss(function_name, function):
                 _tm = thinking_mask.float()
                 _dz = dead_zone_mse(_time_pred, _gt_time_vals)
                 _per_sample = (_dz * _tm).sum(1) / _tm.sum(1).clamp(min=1)
-                _aux_loss = _per_sample.mean()
+                _rewards = inputs.get("rewards")
+                if _rewards is not None:
+                    _reward_mask = (_rewards > 0).to(_per_sample.dtype)
+                    _aux_loss = (_per_sample * _reward_mask).sum() / _reward_mask.sum().clamp(min=1)
+                else:
+                    _aux_loss = _per_sample.mean()
                 loss = loss + _time_loss_w * _aux_loss
                 self._metrics["time_pred_mse"].append(_aux_loss.detach().item())
                 # Log predictor output stats on thinking tokens
                 with torch.no_grad():
-                    _pred_masked = _time_pred[thinking_mask]
+                    _pred_thinking = _time_pred[thinking_mask]
+                    if _rewards is not None:
+                        _reward_mask_bool = (_rewards > 0)
+                        if _reward_mask_bool.any():
+                            _pred_masked = _time_pred[_reward_mask_bool.unsqueeze(1) & thinking_mask]
+                        else:
+                            _pred_masked = _pred_thinking.new_empty((0,))
+                    else:
+                        _pred_masked = _pred_thinking
                     if _pred_masked.numel() > 0:
                         self._metrics["time_pred_mean"].append(_pred_masked.mean().item())
-                        self._metrics["time_pred_std"].append(_pred_masked.std().item())
+                        self._metrics["time_pred_std"].append(_pred_masked.std(unbiased=False).item())
 
         embeds_ratio = inputs["embeds_ratio"]
         embeds_ratio_mask = embeds_ratio < 1.
