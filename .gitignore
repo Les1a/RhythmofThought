@@ -18,6 +18,7 @@ tests/
 /.vscode/*
 /wandb/*
 /unsloth_compiled_cache/*
+/.worktrees/
 
 /data/*
 /retrieved/*
