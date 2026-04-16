@@ -5,18 +5,27 @@ This repository provides the PyTorch implementation for the preprint **Hybrid La
 <img src=assets/intro.png width=1000>
 
 
-## Train Qwen with HRPO
+## Train
 
-To train Qwen using the HRPO framework on your chosen dataset, run the corresponding script. For example, to train on GSM8K:
+Training now uses one explicit mode flag across all task scripts:
+
+```bash
+--mode {grpo,tgrpo,hrpo,thrpo}
+```
+
+For example, to train GSM8K in `hrpo` mode:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python hrpo_gsm8k.py \
+  --mode hrpo \
   --model_name Qwen/Qwen2.5-3B-Instruct \
   --residual_r_min 0.98 \
   --group_size 8 \
 ```
 
 Key arguments:
+* `--mode`
+  One of `grpo`, `tgrpo`, `hrpo`, `thrpo`.
 * `--model_name`
   Directory or name of the HF model.
 * `--group_size`
@@ -26,12 +35,28 @@ Key arguments:
 * `--temperature`
   Sampling temperature for latent exploration.
 
+Convenience shell entrypoints are kept separate by mode:
+
+```bash
+bash run_grpo_all.sh --tasks gsm8k --model Qwen/Qwen2.5-3B-Instruct
+bash run_tgrpo_all.sh --tasks gsm8k --model Qwen/Qwen2.5-3B-Instruct
+bash run_hrpo_all.sh --tasks gsm8k --model Qwen/Qwen2.5-3B-Instruct
+bash run_thrpo_all.sh --tasks gsm8k --model Qwen/Qwen2.5-3B-Instruct
+```
+
 The scripts `hrpo_mmlu.py` and `hrpo_rag.py` expect a single combined training file. To reproduce our results, first merge the training datasets and save locally. Once merged, point `--dataset_root` to the resulting directory and run the corresponding training script.
 
+For lightweight launcher verification or short smoke runs, the training entrypoints also accept:
 
-## Evaluate HRPO
+* `--max_steps`
+  Limit the trainer to a fixed number of optimizer steps.
+* `--max_train_samples`
+  Truncate the loaded training dataset before preprocessing.
 
-To assess HRPO on different datasets, run the corresponding evaluation script. For example, to evaluate on GSM8K:
+
+## Evaluate
+
+To assess a checkpoint, run the corresponding evaluation script. For example, to evaluate on GSM8K:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python eval_gsm8k.py \
@@ -44,7 +69,7 @@ CUDA_VISIBLE_DEVICES=0 python eval_gsm8k.py \
 * `--batch_size`: (optional) Set the batch size for evaluation.
 * `--greedy`: (optional) Greedy decoding in inference.
 
-All evaluation outputs—including metrics and generated examples—will be written to the specified `checkpoint_path` directory.
+Evaluation restores the base model, training mode, and sampling temperature from `adapter_config.json:rot_metadata` stored in the checkpoint. All evaluation outputs, including metrics and generated examples, are written to the specified `checkpoint_path` directory.
 
 
 ## Requirements

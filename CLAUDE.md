@@ -34,39 +34,32 @@ hrpo_{gsm8k,math,mmlu,rag}.py          # Per-task training entry points
                                         #   4. thinking_residual_Lambda → lr_residual_Lambda (1e-3)
 
 eval_{gsm8k,math,mmlust,rag,arcc}.py   # Per-task eval scripts
-   └── Auto-detects base model + temperature from checkpoint path naming convention
+   └── Reads base model + mode + temperature from adapter_config.json:rot_metadata
    └── Loads adapter via model.load_adapter(checkpoint_path)
-   └── Sets model.answer_start = "####" UNLESS --only_grpo is passed
+   └── Restores runtime toggles from adapter metadata
 
-utils.py                                # ANSWER_START="####", SYSTEM_PROMPT, BASE_MODELS list,
+utils.py                                # ANSWER_START="####", SYSTEM_PROMPT,
+                                        # mode parsing, adapter metadata IO,
                                         # reward_func_{math,mmlu,rag}, math/mmlu answer parsers
 patch.py                                # Optimizer surgery (4 param groups)
 prepare_data.py                         # Unified train + eval data preparation (all tasks)
-run_hrpo_all.sh / run_grpo_all.sh       # Unified train+eval orchestration with smart skip logic
+run_{grpo,tgrpo,hrpo,thrpo}_all.sh      # Unified train+eval orchestration with smart skip logic
 ```
 
-### HRPO vs GRPO baseline (`--only_grpo`)
+### Training Modes (`--mode`)
 
-Every training and eval script accepts `--only_grpo`. This is the ablation switch that disables HRPO entirely:
+Training scripts use a single explicit `--mode {grpo,tgrpo,hrpo,thrpo}` switch:
 
-- Training: skips `model.answer_start`, `modules_to_save`, `reset_lambda_parameters()`, and `patch_trainer_optimizer()`. Result: vanilla GRPO LoRA training.
-- Eval: skips `model.answer_start`. Generation runs without thinking residual blending.
-- Output dirs differ: HRPO uses `...-group{G}-lora{R}-rmin{MIN}-temp{T}`, GRPO uses `...-grpo-group{G}-lora{R}-temp{T}`. Both can coexist under `experiments/`.
-- **When evaluating a GRPO checkpoint, you MUST pass `--only_grpo`.** Otherwise the untrained `thinking_residual_*` modules (random init) get applied during generation and corrupt outputs.
+- `grpo` — vanilla GRPO baseline
+- `tgrpo` — GRPO + time conditioning, no thinking residual
+- `hrpo` — thinking residual only
+- `thrpo` — thinking residual + time conditioning
 
-The safety net for this lives in `transformers/generation/utils.py`: thinking-state computation is guarded by `if getattr(self, 'answer_start', None) is not None`.
+Eval scripts no longer accept mode flags. They restore mode, base model, and temperature from adapter metadata.
 
-### Experiment naming convention (load-bearing)
+### Adapter Metadata (load-bearing)
 
-Eval scripts parse the checkpoint path to recover the base model and temperature:
-
-```python
-# from utils.detect_base_model + eval_*.py
-base_model = next(m for m in BASE_MODELS if m.split('/')[-1] in checkpoint_path)
-temperature = float(checkpoint_path.split('-temp')[-1].split('/')[0])
-```
-
-If you rename experiment dirs or invent new naming patterns, eval will break. The format is enforced in each `hrpo_*.py` `main()` function.
+Every saved adapter config includes a `rot_metadata` block with the training mode, base model, task, temperature, and key hyperparameters. Eval loads this metadata instead of inferring anything from the checkpoint path. Directory naming is still useful for humans, but no longer load-bearing for runtime correctness.
 
 ## Common Commands
 
@@ -93,8 +86,9 @@ bash run_hrpo_all.sh --eval-only --tasks gsm8k,math
 # Paper-original batch sizes (default is H200-optimized: BS↑, GA=1, same effective BS)
 bash run_hrpo_all.sh --paper-params
 
-# GRPO baseline (same flags, passes --only_grpo to all subcommands)
+# GRPO and TGRPO baselines
 bash run_grpo_all.sh --tasks gsm8k --no-wandb
+bash run_tgrpo_all.sh --tasks gsm8k --no-wandb
 
 # Dry run (print commands, don't execute)
 bash run_hrpo_all.sh --dry-run
@@ -111,41 +105,26 @@ Smart skip: training is skipped if `experiments/{exp_name}/checkpoint-*` exists;
 
 ```bash
 # Train (single task)
-CUDA_VISIBLE_DEVICES=0 python hrpo_gsm8k.py --model_name Qwen/Qwen2.5-3B-Instruct --group_size 4 --residual_r_min 0.99
-CUDA_VISIBLE_DEVICES=0 python hrpo_math.py  --dataset_root ../MATH               --group_size 8
-CUDA_VISIBLE_DEVICES=0 python hrpo_mmlu.py  --dataset_root ../MMLU_Train_Merged  --group_size 8
-CUDA_VISIBLE_DEVICES=0 python hrpo_rag.py   --dataset_root ../RAG_Train_Merged   --group_size 4
+CUDA_VISIBLE_DEVICES=0 python hrpo_gsm8k.py --mode hrpo --model_name Qwen/Qwen2.5-3B-Instruct --group_size 4 --residual_r_min 0.99
+CUDA_VISIBLE_DEVICES=0 python hrpo_math.py  --mode hrpo --dataset_root ../MATH               --group_size 8
+CUDA_VISIBLE_DEVICES=0 python hrpo_mmlu.py  --mode hrpo --dataset_root ../MMLU_Train_Merged  --group_size 8
+CUDA_VISIBLE_DEVICES=0 python hrpo_rag.py   --mode hrpo --dataset_root ../RAG_Train_Merged   --group_size 4
 
-# Eval (path determines base_model and temperature — see naming convention above)
+# Eval (reads mode/base model/temperature from adapter metadata)
 CUDA_VISIBLE_DEVICES=0 python eval_gsm8k.py --checkpoint_path ./experiments/.../checkpoint-935 --batch_size 128
 CUDA_VISIBLE_DEVICES=0 python eval_math.py  --checkpoint_path ./experiments/.../checkpoint-500 --batch_size 128
 CUDA_VISIBLE_DEVICES=0 python eval_mmlust.py --checkpoint_path ./experiments/.../checkpoint-500 --batch_size 128
 CUDA_VISIBLE_DEVICES=0 python eval_rag.py    --checkpoint_path ./experiments/.../checkpoint-500 --batch_size 128
 CUDA_VISIBLE_DEVICES=0 python eval_arcc.py   --checkpoint_path ./experiments/.../checkpoint-500 --batch_size 128
-
-# GRPO baseline — note --only_grpo on BOTH training and eval
-CUDA_VISIBLE_DEVICES=0 python hrpo_gsm8k.py --only_grpo --model_name Qwen/Qwen2.5-1.5B-Instruct --group_size 4
-CUDA_VISIBLE_DEVICES=0 python eval_gsm8k.py --only_grpo --checkpoint_path ./experiments/...-grpo-.../checkpoint-250
 ```
-
-## Supported Models
-
-`utils.BASE_MODELS` lists the recognized bases (used by `detect_base_model()` in every eval script):
-
-- `Qwen/Qwen2.5-1.5B-Instruct`, `Qwen/Qwen2.5-3B-Instruct`
-- `meta-llama/Llama-3.2-1B-Instruct`, `meta-llama/Llama-3.2-3B-Instruct`
-
-Adding a new model requires updating this list AND ensuring the architecture file under `transformers/models/` has the `ThinkingResidualLambda` modifications.
 
 ## Key Training Metrics
 
 When monitoring runs (WandB project: `latent-reasoning`):
 
-- `embeds_ratio` — average `a_t` (embedding weight). Starts ~0.997, should decrease as training progresses.
-- `hidden_ratio` — average `sqrt(1-a_t^2)` (residual weight). Starts ~0.074, should increase.
+- `residual_active_fraction`, `residual_embed_ratio`, `residual_hidden_ratio` — rollout-time residual usage
+- `thinking_time_aux_loss`, `thinking_time_pred_error`, `thinking_time_rollout_error`, `thinking_time_embed_std` — time-conditioning supervision
 - `reward`, `completion_length`, `kl` — standard GRPO signals.
-
-If `embeds_ratio` never moves off ~0.997, the Lambda learning rate (`--lr_residual_Lambda`, default 1e-3 — 200× the main LR) is being suppressed; check that `patch_trainer_optimizer()` ran.
 
 ## Environment Pinning Gotchas
 
