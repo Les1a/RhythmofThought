@@ -454,58 +454,20 @@ def grpo_trainer_compute_loss(function_name, function):
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
 
         # GT time conditioning setup for training
-        _time_loss_w = getattr(self, 'time_loss_weight', 0)
-        _base = None
-        _gt_time_vals = None
-        _use_time_cond = False
-        if _time_loss_w > 0 or thinking_mask is not None:
-            _unwrapped = self.accelerator.unwrap_model(model)
-            _base = _unwrapped.base_model.model.model if hasattr(_unwrapped, 'base_model') else _unwrapped.model
-            _use_time_cond = bool(
-                getattr(_base, 'use_time_conditioning', False) and hasattr(_base, 'sinusoidal_time_embedding')
-            )
-            from time_conditioning import reset_time_conditioning_state
-            reset_time_conditioning_state(_base)
+        _thinking_time_loss_w = getattr(self, 'thinking_time_loss_weight', 0)
+        from time_conditioning import prepare_time_conditioning_training_step
 
-        # When thinking is not active (e.g. only_grpo), thinking_mask only covers
-        # prompt tokens and won't match the full input_ids length — disable it.
-        if thinking_mask is not None and thinking_mask.shape[1] != input_ids.shape[1]:
-            if _use_time_cond or _time_loss_w > 0:
-                raise ValueError(
-                    f"time_conditioning: thinking_mask shape {thinking_mask.shape} does not match "
-                    f"input_ids shape {input_ids.shape}. This indicates a data pipeline bug."
-                )
+        _base, _use_time_cond, _gt_thinking_time, thinking_mask, _source_stats = prepare_time_conditioning_training_step(
+            self.accelerator.unwrap_model(model),
+            input_ids=input_ids,
+            thinking_mask=thinking_mask,
+            rollout_thinking_time=inputs.get("rollout_thinking_time"),
+            thinking_time_loss_weight=_thinking_time_loss_w,
+        )
+        if thinking_mask is None:
             thinking_embeds = None
-            thinking_mask = None
-
-        # Set time embeddings on base model before forward.
-        # AdaLN linearly anneals from GT time to rollout-predicted time.
-        # GT time is kept for the aux predictor loss below.
-        # Clone tensors to escape inference-mode from generation phase;
-        # gradient checkpointing (use_reentrant=True) cannot save inference tensors.
-        if _use_time_cond and _base is not None:
-            if thinking_mask is not None and thinking_mask.shape[1] == input_ids.shape[1]:
-                from time_conditioning import compute_gt_time, select_training_time_embedding
-                _gt_time_vals = compute_gt_time(thinking_mask.clone())
-                _rollout_tp = inputs.get("rollout_time_pred")
-                _max_steps = getattr(self.state, "max_steps", 0) or 0
-                if _max_steps <= 0:
-                    _max_steps = getattr(self.args, "max_steps", 0)
-                _base._gt_time_emb, _pred_prob, _effective_rollout_alpha = select_training_time_embedding(
-                    _base,
-                    _gt_time_vals,
-                    _rollout_tp,
-                    global_step=self.state.global_step,
-                    max_steps=_max_steps,
-                    thinking_mask=thinking_mask.clone(),
-                )
-                _base._gt_time_mask = thinking_mask.clone()
-                self._metrics["time_cond_rollout_available"].append(float(_rollout_tp is not None))
-                self._metrics["time_cond_mix_alpha"].append(_pred_prob)
-                self._metrics["time_cond_rollout_effective_alpha"].append(_effective_rollout_alpha)
-            else:
-                _base._gt_time_emb = None
-                _base._gt_time_mask = None
+        for _metric_name, _metric_value in _source_stats.items():
+            self._metrics[_metric_name].append(_metric_value)
 
         bsz, qlen = input_ids.shape
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
@@ -533,60 +495,44 @@ def grpo_trainer_compute_loss(function_name, function):
                     n_chunks = self.args.unsloth_num_chunks,
                 )
         finally:
-            # Clear GT time emb after forward (even on exception)
             if _use_time_cond and _base is not None:
-                _base._gt_time_emb = None
-                _base._gt_time_mask = None
+                from time_conditioning import clear_training_time_conditioning_forward_cache
 
-        # Time predictor aux loss: MSE between predictor output and GT time
-        if _time_loss_w > 0 and _base is not None and _gt_time_vals is not None:
-            _time_pred = getattr(_base, '_last_time_pred', None)
-            if _time_pred is not None:
-                from time_conditioning import dead_zone_mse
-                _tm = thinking_mask.float()
-                _dz = dead_zone_mse(_time_pred, _gt_time_vals)
-                _per_sample = (_dz * _tm).sum(1) / _tm.sum(1).clamp(min=1)
-                _rewards = inputs.get("rewards")
-                if _rewards is not None:
-                    _aux_weights = _rewards
-                else:
-                    _aux_weights = torch.ones_like(_per_sample)
-                _aux_weights = _aux_weights.to(device=_per_sample.device, dtype=_per_sample.dtype)
-                _aux_loss = (_per_sample * _aux_weights).mean()
-                loss = loss + _time_loss_w * _aux_loss
-                self._metrics["time_pred_mse"].append(_aux_loss.detach().item())
-                self._metrics["time_aux_weight_mean"].append(_aux_weights.mean().item())
-                self._metrics["time_aux_weight_min"].append(_aux_weights.min().item())
-                self._metrics["time_aux_weight_max"].append(_aux_weights.max().item())
-                # Log predictor output stats on thinking tokens
-                with torch.no_grad():
-                    _pred_thinking = _time_pred[thinking_mask]
-                    if _pred_thinking.numel() > 0:
-                        self._metrics["time_pred_mean"].append(_pred_thinking.mean().item())
-                        self._metrics["time_pred_std"].append(_pred_thinking.std(unbiased=False).item())
+                clear_training_time_conditioning_forward_cache(_base)
+
+        # Time predictor auxiliary loss
+        if _thinking_time_loss_w > 0 and _base is not None and _gt_thinking_time is not None:
+            from time_conditioning import compute_thinking_time_aux_loss
+
+            _aux_loss, _aux_metrics = compute_thinking_time_aux_loss(
+                _base,
+                gt_thinking_time=_gt_thinking_time,
+                thinking_mask=thinking_mask,
+                prompt_mask=prompt_mask,
+                rewards=inputs.get("rewards"),
+            )
+            if _aux_loss is not None:
+                loss = loss + _thinking_time_loss_w * _aux_loss
+                for _metric_name, _metric_value in _aux_metrics.items():
+                    self._metrics[_metric_name].append(_metric_value)
 
         if _use_time_cond and _base is not None:
             from time_conditioning import reset_time_conditioning_state
             reset_time_conditioning_state(_base)
 
-        embeds_ratio = inputs["embeds_ratio"]
-        embeds_ratio_mask = embeds_ratio < 1.
-        if embeds_ratio_mask.any():
-            mean_embeds_ratio = embeds_ratio[embeds_ratio_mask].mean()
-            mean_hidden_ratio = torch.sqrt(1 - embeds_ratio[embeds_ratio_mask] ** 2).mean()
-        else:
-            mean_embeds_ratio = torch.tensor(1.0)
-            mean_hidden_ratio = torch.tensor(0.0)
+        from time_conditioning import summarize_residual_rollout_metrics
+
+        residual_metrics = summarize_residual_rollout_metrics(inputs.get("embeds_ratio"))
 
         if "train" in self._metrics:
             mode = "eval" if self.control.should_evaluate else "train"
-            self._metrics[mode]["embeds_ratio"].append(mean_embeds_ratio.item())
-            self._metrics[mode]["hidden_ratio"].append(mean_hidden_ratio.item())
+            for _metric_name, _metric_value in residual_metrics.items():
+                self._metrics[mode][_metric_name].append(_metric_value)
             self._metrics[mode]["completion_length"].append(completion_length.item())
             self._metrics[mode]["kl"].append(mean_kl.item())
         else:
-            self._metrics["embeds_ratio"].append(mean_embeds_ratio.item())
-            self._metrics["hidden_ratio"].append(mean_hidden_ratio.item())
+            for _metric_name, _metric_value in residual_metrics.items():
+                self._metrics[_metric_name].append(_metric_value)
             self._metrics["completion_length"].append(completion_length.item())
             self._metrics["kl"].append(mean_kl.item())
         return loss

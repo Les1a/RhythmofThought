@@ -23,6 +23,14 @@
 #                         experiment dir instead of skipping. Errors if a task's
 #                         experiment dir is missing or contains no checkpoint-*.
 #                         Hyperparameters must match the original run.
+#   --mode MODE           Internal override: hrpo or thrpo (default: hrpo)
+#   --thinking-time-loss-weight V
+#                         Thinking-time auxiliary loss weight (default: 0.1)
+#   --lr-time-cond V      Learning rate for time conditioning modules (default: 1e-4)
+#   --exp-suffix NAME     Append a suffix to experiment dir names to avoid
+#                         checkpoint collisions with previous runs
+#   --max-steps N         Override trainer max_steps for smoke tests or short runs
+#   --max-train-samples N Limit the loaded training dataset before tokenization
 #   --no-wandb            Disable WandB logging
 #   --prep-data           Run prepare_data.py for selected --tasks before training/eval
 #   --dry-run             Print commands without executing
@@ -70,9 +78,13 @@ NO_WANDB=false
 PREP_DATA=false
 DRY_RUN=false
 RESUME=false
-TIME_CONDITIONING=false
-TIME_LOSS_WEIGHT=0.1
+MODE="hrpo"
+THINKING_TIME_LOSS_WEIGHT=0.1
 LR_TIME_CONDITIONING=1e-4
+EXP_SUFFIX=""
+MAX_STEPS=-1
+MAX_TRAIN_SAMPLES=""
+MODE_LABEL="HRPO"
 FAILED_TASKS=()
 
 # ========================= Argument Parsing ==================================
@@ -96,16 +108,38 @@ while [[ $# -gt 0 ]]; do
         --eval-only)  EVAL_ONLY=true; shift ;;
         --skip-eval)  SKIP_EVAL=true; shift ;;
         --resume)     RESUME=true; shift ;;
+        --mode)       MODE="$2"; shift 2 ;;
         --no-wandb)   NO_WANDB=true; shift ;;
         --prep-data)  PREP_DATA=true; shift ;;
         --dry-run)    DRY_RUN=true; shift ;;
-        --time-cond)  TIME_CONDITIONING=true; shift ;;
-        --time-loss-weight) TIME_LOSS_WEIGHT="$2"; shift 2 ;;
+        --thinking-time-loss-weight) THINKING_TIME_LOSS_WEIGHT="$2"; shift 2 ;;
         --lr-time-cond)     LR_TIME_CONDITIONING="$2"; shift 2 ;;
+        --exp-suffix)       EXP_SUFFIX="$2"; shift 2 ;;
+        --max-steps)        MAX_STEPS="$2"; shift 2 ;;
+        --max-train-samples) MAX_TRAIN_SAMPLES="$2"; shift 2 ;;
         --help|-h)    show_help ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+case "$MODE" in
+    hrpo) MODE_LABEL="HRPO" ;;
+    thrpo) MODE_LABEL="THRPO" ;;
+    *)
+        echo "Unsupported mode for run_hrpo_all.sh: ${MODE} (expected hrpo or thrpo)"
+        exit 1
+        ;;
+esac
+
+if ! [[ "${MAX_STEPS}" =~ ^-?[0-9]+$ ]]; then
+    echo "Invalid value for --max-steps: ${MAX_STEPS}"
+    exit 1
+fi
+
+if [ -n "${MAX_TRAIN_SAMPLES}" ] && ! [[ "${MAX_TRAIN_SAMPLES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Invalid value for --max-train-samples: ${MAX_TRAIN_SAMPLES}"
+    exit 1
+fi
 
 # ========================= Utility Functions =================================
 log() {
@@ -113,18 +147,39 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$task] $*"
 }
 
+normalize_exp_suffix() {
+    local raw="$1"
+    raw=$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    raw=$(printf '%s' "$raw" | tr -cs 'A-Za-z0-9._-' '-')
+    raw=$(printf '%s' "$raw" | sed -e 's/^[.-]*//' -e 's/[.-]*$//')
+    printf '%s' "$raw"
+}
+
+EXP_SUFFIX=$(normalize_exp_suffix "$EXP_SUFFIX")
+
 get_exp_name() {
     local task="$1"
     local group_size="$2"
     local model_short="${MODEL##*/}"
-    local mode="hrpo"
-    [ "$TIME_CONDITIONING" = true ] && mode="thrpo"
-    echo "./experiments/${model_short}-${task}-${mode}-group${group_size}-lora${LORA_RANK}-rmin${RESIDUAL_R_MIN}-temp${TEMPERATURE}"
+    local suffix_segment=""
+    [ -n "$EXP_SUFFIX" ] && suffix_segment="-${EXP_SUFFIX}"
+    echo "./experiments/${model_short}-${task}-${MODE}-group${group_size}-lora${LORA_RANK}-rmin${RESIDUAL_R_MIN}-temp${TEMPERATURE}${suffix_segment}"
 }
 
 find_latest_checkpoint() {
     local exp_dir="$1"
     ls -d "${exp_dir}"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1
+}
+
+dry_run_checkpoint_hint() {
+    local exp_dir="$1"
+    local ckpt
+    ckpt=$(find_latest_checkpoint "$exp_dir")
+    if [ -n "$ckpt" ]; then
+        echo "$ckpt"
+    else
+        echo "${exp_dir}/checkpoint-<latest>"
+    fi
 }
 
 check_dataset() {
@@ -148,6 +203,29 @@ check_dataset() {
             fi ;;
     esac
     return 0
+}
+
+common_train_args() {
+    echo "--mode ${MODE} \
+        --model_name ${MODEL} \
+        ${EXP_SUFFIX:+--exp-suffix ${EXP_SUFFIX}} \
+        --lora_rank ${LORA_RANK} \
+        --lr ${LR} \
+        --beta ${BETA} \
+        --residual_r_min ${RESIDUAL_R_MIN} \
+        --residual_r_max ${RESIDUAL_R_MAX} \
+        --lr_residual_gate ${LR_RESIDUAL_GATE} \
+        --lr_residual_Lambda ${LR_RESIDUAL_LAMBDA} \
+        --weight_decay ${WEIGHT_DECAY} \
+        --warmup_ratio ${WARMUP_RATIO} \
+        --lr_scheduler_type ${LR_SCHEDULER_TYPE} \
+        --optimizer ${OPTIMIZER} \
+        --max_grad_norm ${MAX_GRAD_NORM} \
+        --temperature ${TEMPERATURE} \
+        --seed ${SEED} \
+        $( [ "${MAX_STEPS}" -gt 0 ] && echo "--max_steps ${MAX_STEPS}" ) \
+        $( [ -n "${MAX_TRAIN_SAMPLES}" ] && echo "--max_train_samples ${MAX_TRAIN_SAMPLES}" ) \
+        $( [ "$MODE" = "thrpo" ] && echo "--thinking_time_loss_weight ${THINKING_TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" )"
 }
 
 # ========================= Conda Activation ==================================
@@ -183,6 +261,7 @@ train_task() {
 
     log "$task" "Experiment: ${exp_name}"
     log "$task" "Effective batch size: $((bs * ga)) (BS=${bs} x GA=${ga})"
+    log "$task" "Launch config: max_steps=${MAX_STEPS}, max_train_samples=${MAX_TRAIN_SAMPLES:-all}"
 
     # Resolve resume vs. skip vs. fresh-train. The python script does the actual
     # state restore; here we only decide whether to invoke it and with what flag.
@@ -200,8 +279,9 @@ train_task() {
             log "$task" "ERROR: --resume specified but no checkpoint-* found in ${exp_name}"
             return 1
         fi
-        log "$task" "WARNING: Stale experiment dir (no checkpoint). Cleaning ${exp_name}..."
-        rm -rf "$exp_name"
+        log "$task" "ERROR: Experiment dir exists but contains no checkpoint-* entries: ${exp_name}"
+        log "$task" "ERROR: Clean it manually or use a different --exp-suffix"
+        return 1
     elif [ "$RESUME" = true ]; then
         log "$task" "ERROR: --resume specified but ${exp_name} does not exist"
         return 1
@@ -215,7 +295,7 @@ train_task() {
         [ -n "$dataset_root" ] && echo "    --dataset_root ${dataset_root} \\"
         echo "    --per_device_train_batch_size ${bs} --gradient_accumulation_steps ${ga} \\"
         echo "    --group_size ${group_size} --max_prompt_length ${max_prompt} --max_completion_length ${max_completion} \\"
-        echo "    --model_name ${MODEL} --lora_rank ${LORA_RANK} --lr ${LR} --beta ${BETA} --temperature ${TEMPERATURE} --seed ${SEED}${resume_arg:+ ${resume_arg}}"
+        echo "    $(common_train_args)${resume_arg:+ ${resume_arg}}"
         return 0
     fi
 
@@ -227,22 +307,7 @@ train_task() {
         --group_size ${group_size} \
         --max_prompt_length ${max_prompt} \
         --max_completion_length ${max_completion} \
-        --model_name "${MODEL}" \
-        --lora_rank ${LORA_RANK} \
-        --lr ${LR} \
-        --beta ${BETA} \
-        --residual_r_min ${RESIDUAL_R_MIN} \
-        --residual_r_max ${RESIDUAL_R_MAX} \
-        --lr_residual_gate ${LR_RESIDUAL_GATE} \
-        --lr_residual_Lambda ${LR_RESIDUAL_LAMBDA} \
-        --weight_decay ${WEIGHT_DECAY} \
-        --warmup_ratio ${WARMUP_RATIO} \
-        --lr_scheduler_type ${LR_SCHEDULER_TYPE} \
-        --optimizer ${OPTIMIZER} \
-        --max_grad_norm ${MAX_GRAD_NORM} \
-        --temperature ${TEMPERATURE} \
-        --seed ${SEED} \
-        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" ) \
+        $(common_train_args) \
         2>&1 | tee "${logfile}"
 }
 
@@ -258,6 +323,9 @@ eval_gsm8k() {
     exp_name=$(get_exp_name "$task" 4)
     local ckpt
     ckpt=$(find_latest_checkpoint "$exp_name")
+    if [ "$DRY_RUN" = true ] && [ -z "$ckpt" ]; then
+        ckpt=$(dry_run_checkpoint_hint "$exp_name")
+    fi
 
     if [ -z "$ckpt" ]; then
         log "$task" "No checkpoint found in ${exp_name}, skipping eval"
@@ -289,6 +357,9 @@ eval_math() {
     exp_name=$(get_exp_name "$task" 8)
     local ckpt
     ckpt=$(find_latest_checkpoint "$exp_name")
+    if [ "$DRY_RUN" = true ] && [ -z "$ckpt" ]; then
+        ckpt=$(dry_run_checkpoint_hint "$exp_name")
+    fi
 
     if [ -z "$ckpt" ]; then
         log "$task" "No checkpoint found in ${exp_name}, skipping eval"
@@ -320,6 +391,9 @@ eval_mmlu() {
     exp_name=$(get_exp_name "$task" 8)
     local ckpt
     ckpt=$(find_latest_checkpoint "$exp_name")
+    if [ "$DRY_RUN" = true ] && [ -z "$ckpt" ]; then
+        ckpt=$(dry_run_checkpoint_hint "$exp_name")
+    fi
 
     if [ -z "$ckpt" ]; then
         log "$task" "No checkpoint found in ${exp_name}, skipping eval"
@@ -351,6 +425,9 @@ eval_arcc() {
     exp_name=$(get_exp_name "mmlu" 8)  # ARC-C shares checkpoint with MMLU
     local ckpt
     ckpt=$(find_latest_checkpoint "$exp_name")
+    if [ "$DRY_RUN" = true ] && [ -z "$ckpt" ]; then
+        ckpt=$(dry_run_checkpoint_hint "$exp_name")
+    fi
 
     if [ -z "$ckpt" ]; then
         log "$task" "No checkpoint found in ${exp_name}, skipping eval"
@@ -382,6 +459,9 @@ eval_rag() {
     exp_name=$(get_exp_name "$task" 4)
     local ckpt
     ckpt=$(find_latest_checkpoint "$exp_name")
+    if [ "$DRY_RUN" = true ] && [ -z "$ckpt" ]; then
+        ckpt=$(dry_run_checkpoint_hint "$exp_name")
+    fi
 
     if [ -z "$ckpt" ]; then
         log "$task" "No checkpoint found in ${exp_name}, skipping eval"
@@ -434,11 +514,18 @@ eval_rag() {
 print_summary() {
     echo ""
     echo "============================================================"
-    echo "                   HRPO Pipeline Summary"
+    if [ "$MODE" = "thrpo" ]; then
+        echo "                  THRPO Pipeline Summary"
+    else
+        echo "                   HRPO Pipeline Summary"
+    fi
     echo "============================================================"
     echo "Model:  ${MODEL}"
     echo "GPU:    ${GPU_ID}"
     echo "Tasks:  ${TASKS}"
+    if [ "$MODE" = "thrpo" ]; then
+        echo "Time conditioning: thinking_time_loss_weight=${THINKING_TIME_LOSS_WEIGHT}, lr=${LR_TIME_CONDITIONING}"
+    fi
     echo ""
 
     for task in "${TASK_LIST[@]}"; do
@@ -535,11 +622,14 @@ print(f\"{d['metrics']['accuracy']:.4f}\")
 # ========================= Main ==============================================
 main() {
     log "MAIN" "=========================================="
-    log "MAIN" "HRPO Training & Evaluation Pipeline"
+    log "MAIN" "${MODE_LABEL} Training & Evaluation Pipeline"
     log "MAIN" "=========================================="
     log "MAIN" "Model:       ${MODEL}"
     log "MAIN" "GPU:         ${GPU_ID}"
     log "MAIN" "Tasks:       ${TASKS}"
+    if [ "$MODE" = "thrpo" ]; then
+        log "MAIN" "Time cond:   enabled (thinking_time_loss_weight=${THINKING_TIME_LOSS_WEIGHT}, lr=${LR_TIME_CONDITIONING})"
+    fi
     log "MAIN" "Eval only:   ${EVAL_ONLY}"
     log "MAIN" "Skip eval:   ${SKIP_EVAL}"
     log "MAIN" "Resume:      ${RESUME}"
@@ -560,9 +650,11 @@ main() {
     # Activate conda
     activate_env
 
-    # Disable WandB if requested
+    # Disable WandB if requested.
+    # Prefer WANDB_MODE over WANDB_DISABLED to avoid upstream deprecation noise.
     if [ "$NO_WANDB" = true ]; then
-        export WANDB_DISABLED=true
+        unset WANDB_DISABLED
+        export WANDB_MODE=disabled
         log "MAIN" "WandB disabled"
     fi
 
@@ -608,7 +700,7 @@ main() {
     # Training phase
     if [ "$EVAL_ONLY" != true ]; then
         for task in "${TASK_LIST[@]}"; do
-            log "MAIN" "==================== Training: ${task} ===================="
+            log "MAIN" "==================== Training ${MODE_LABEL}: ${task} ===================="
             if ! "train_${task}"; then
                 log "MAIN" "WARNING: Training ${task} failed"
                 FAILED_TASKS+=("train_${task}")
@@ -619,14 +711,14 @@ main() {
     # Evaluation phase
     if [ "$SKIP_EVAL" != true ]; then
         for task in "${TASK_LIST[@]}"; do
-            log "MAIN" "==================== Evaluating: ${task} ===================="
+            log "MAIN" "==================== Evaluating ${MODE_LABEL}: ${task} ===================="
             if ! "eval_${task}"; then
                 log "MAIN" "WARNING: Evaluation ${task} failed"
                 FAILED_TASKS+=("eval_${task}")
             fi
             # ARC-C shares checkpoint with MMLU (paper trains on merged MMLU+ARC-C)
             if [ "$task" = "mmlu" ]; then
-                log "MAIN" "==================== Evaluating: arcc (from mmlu checkpoint) ===================="
+                log "MAIN" "==================== Evaluating ${MODE_LABEL}: arcc (from mmlu checkpoint) ===================="
                 if ! eval_arcc; then
                     log "MAIN" "WARNING: Evaluation arcc failed"
                     FAILED_TASKS+=("eval_arcc")

@@ -1,6 +1,8 @@
 import types
 from transformers.trainer import *
 
+from time_conditioning import TIME_CONDITIONING_MODULE_NAMES
+
 
 def patch_trainer_optimizer(
     trainer,
@@ -19,76 +21,56 @@ def patch_trainer_optimizer(
 
         if self.optimizer is None:
             decay_parameters = self.get_decay_parameter_names(opt_model)
-            _special = ("thinking_residual", "adaln_", "time_progress_predictor", "sinusoidal_time_embedding")
+            optimizer_groups = {
+                ("base", True): [],
+                ("base", False): [],
+                ("thinking_residual_gate", True): [],
+                ("thinking_residual_gate", False): [],
+                ("thinking_residual_Lambda", True): [],
+                ("thinking_residual_Lambda", False): [],
+                ("time_conditioning", True): [],
+                ("time_conditioning", False): [],
+            }
 
-            def _is_special(n):
-                return any(s in n for s in _special)
+            for name, param in opt_model.named_parameters():
+                if not param.requires_grad:
+                    continue
 
-            def _collect_group_params(predicate, use_decay):
-                return [
-                    p
-                    for n, p in opt_model.named_parameters()
-                    if predicate(n)
-                    and (n in decay_parameters) is use_decay
-                    and p.requires_grad
-                ]
+                use_decay = name in decay_parameters
+                target_group = None
+                if "thinking_residual_gate" in name:
+                    target_group = "thinking_residual_gate" if lr_thinking_residual_gate is not None else None
+                elif "thinking_residual_Lambda" in name:
+                    target_group = "thinking_residual_Lambda" if thinking_residual_Lambda is not None else None
+                elif any(module_name in name for module_name in TIME_CONDITIONING_MODULE_NAMES):
+                    target_group = "time_conditioning" if lr_time_conditioning is not None else None
+                elif "thinking_residual" not in name:
+                    target_group = "base"
 
-            def _append_split_groups(groups, predicate, lr):
+                if target_group is not None:
+                    optimizer_groups[(target_group, use_decay)].append(param)
+
+            group_lrs = {
+                "base": self.args.learning_rate,
+                "thinking_residual_gate": lr_thinking_residual_gate,
+                "thinking_residual_Lambda": thinking_residual_Lambda,
+                "time_conditioning": lr_time_conditioning,
+            }
+            optimizer_grouped_parameters = []
+            for group_name, lr in group_lrs.items():
                 if lr is None:
-                    return
-                decay_group = _collect_group_params(predicate, use_decay=True)
-                no_decay_group = _collect_group_params(predicate, use_decay=False)
-                if decay_group:
-                    groups.append(
+                    continue
+                for use_decay in (True, False):
+                    params = optimizer_groups[(group_name, use_decay)]
+                    if not params:
+                        continue
+                    optimizer_grouped_parameters.append(
                         {
-                            "params": decay_group,
+                            "params": params,
                             "lr": lr,
-                            "weight_decay": self.args.weight_decay,
+                            "weight_decay": self.args.weight_decay if use_decay else 0.0,
                         }
                     )
-                if no_decay_group:
-                    groups.append(
-                        {
-                            "params": no_decay_group,
-                            "lr": lr,
-                            "weight_decay": 0.0,
-                        }
-                    )
-
-            optimizer_grouped_parameters = [
-                {
-                    "params": _collect_group_params(lambda n: not _is_special(n), use_decay=True),
-                    "lr": self.args.learning_rate,
-                    "weight_decay": self.args.weight_decay,
-                },
-                {
-                    "params": _collect_group_params(lambda n: not _is_special(n), use_decay=False),
-                    "lr": self.args.learning_rate,
-                    "weight_decay": 0.0,
-                },
-            ]
-            optimizer_grouped_parameters = [
-                group for group in optimizer_grouped_parameters if group["params"]
-            ]
-
-            _append_split_groups(
-                optimizer_grouped_parameters,
-                lambda n: "thinking_residual_gate" in n,
-                lr_thinking_residual_gate,
-            )
-            _append_split_groups(
-                optimizer_grouped_parameters,
-                lambda n: "thinking_residual_Lambda" in n,
-                thinking_residual_Lambda,
-            )
-
-            if lr_time_conditioning is not None:
-                _tc_names = ("sinusoidal_time_embedding", "adaln_proj", "time_progress_predictor")
-                _append_split_groups(
-                    optimizer_grouped_parameters,
-                    lambda n: any(tc in n for tc in _tc_names),
-                    lr_time_conditioning,
-                )
 
             if self.optimizer_cls_and_kwargs is not None:
                 optimizer_cls, optimizer_kwargs = self.optimizer_cls_and_kwargs

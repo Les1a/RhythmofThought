@@ -36,7 +36,12 @@ from ...utils.deprecation import deprecate_kwarg
 from .configuration_qwen2 import Qwen2Config
 
 try:
-    from time_conditioning import AdaLNProjection, TimeProgressPredictor, SinusoidalTimeEmbedding
+    from time_conditioning import (
+        AdaLNProjection,
+        ReasoningTimeEmbedding,
+        ThinkingTimePredictor,
+        prepare_adaln_modulation,
+    )
     _HAS_TIME_CONDITIONING = True
 except ImportError:
     _HAS_TIME_CONDITIONING = False
@@ -243,8 +248,11 @@ class Qwen2DecoderLayer(nn.Module):
 
         if _HAS_TIME_CONDITIONING and getattr(config, 'use_time_conditioning', False):
             self.adaln_proj = AdaLNProjection(
-                time_embed_dim=getattr(config, 'time_embed_dim', 256),
+                thinking_time_embed_dim=getattr(config, 'thinking_time_embed_dim', 256),
                 hidden_size=config.hidden_size,
+                gamma_cap=getattr(config, "thinking_time_gamma_cap", 0.99),
+                beta_cap=getattr(config, "thinking_time_beta_cap", 0.99),
+                alpha_cap=getattr(config, "thinking_time_alpha_cap", 0.99),
             )
 
         if config.sliding_window and config._attn_implementation != "flash_attention_2":
@@ -263,20 +271,16 @@ class Qwen2DecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        time_emb: Optional[torch.Tensor] = None,
-        time_mask: Optional[torch.Tensor] = None,
+        thinking_time_emb: Optional[torch.Tensor] = None,
+        thinking_time_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         # Per-layer AdaLN: compute scale/shift/gate for both norms
-        if time_emb is not None and hasattr(self, 'adaln_proj'):
-            gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.adaln_proj(time_emb)
-            if time_mask is not None:
-                # Masked AdaLN: identity for non-thinking positions
-                m = time_mask.unsqueeze(-1).to(dtype=gamma1.dtype)  # (B, N, 1)
-                gamma1, beta1 = gamma1 * m, beta1 * m
-                alpha1 = 1.0 + (alpha1 - 1.0) * m
-                gamma2, beta2 = gamma2 * m, beta2 * m
-                alpha2 = 1.0 + (alpha2 - 1.0) * m
+        if thinking_time_emb is not None and hasattr(self, 'adaln_proj'):
+            gamma1, beta1, alpha1, gamma2, beta2, alpha2 = prepare_adaln_modulation(
+                self.adaln_proj(thinking_time_emb),
+                thinking_time_mask=thinking_time_mask,
+            )
         else:
             gamma1 = beta1 = alpha1 = gamma2 = beta2 = alpha2 = None
 
@@ -560,9 +564,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.thinking_residual_Lambda = ThinkingResidualLambda(config)
 
         if _HAS_TIME_CONDITIONING and getattr(config, 'use_time_conditioning', False):
-            _te_dim = getattr(config, 'time_embed_dim', 256)
-            self.time_progress_predictor = TimeProgressPredictor(config.hidden_size)
-            self.sinusoidal_time_embedding = SinusoidalTimeEmbedding(time_embed_dim=_te_dim)
+            _te_dim = getattr(config, 'thinking_time_embed_dim', 256)
+            self.thinking_time_predictor = ThinkingTimePredictor(config.hidden_size)
+            self.reasoning_time_embedding = ReasoningTimeEmbedding(
+                thinking_time_embed_dim=_te_dim,
+                num_frequencies=getattr(config, "thinking_time_num_frequencies", 32),
+                min_frequency=getattr(config, "thinking_time_min_frequency", 1.0),
+                max_frequency=getattr(config, "thinking_time_max_frequency", 6.0),
+                thinking_time_std_init=getattr(config, "thinking_time_std_init", 0.05),
+            )
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -632,19 +642,20 @@ class Qwen2Model(Qwen2PreTrainedModel):
         hidden_states = inputs_embeds
 
         # Time conditioning: dual mode (GT for training, predictor for rollout/inference)
-        time_emb = None
-        time_mask = None
+        thinking_time_emb = None
+        thinking_time_mask = None
         _is_thinking = flash_attn_kwargs.get('is_thinking', None)
-        if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
-            _gt = getattr(self, '_gt_time_emb', None)
+        from time_conditioning import has_time_conditioning
+        if has_time_conditioning(self):
+            _gt = getattr(self, '_train_thinking_time_emb', None)
             if _gt is not None:
-                # GT mode (training): use pre-computed time embeddings
-                time_emb = _gt
-                time_mask = getattr(self, '_gt_time_mask', None)
+                # GT mode (training): use pre-computed thinking-time embeddings
+                thinking_time_emb = _gt
+                thinking_time_mask = getattr(self, '_train_thinking_time_mask', None)
             else:
                 # Predictor mode (rollout/inference): use cached hidden state
-                from time_conditioning import prepare_online_time_conditioning
-                time_emb, time_mask, _ = prepare_online_time_conditioning(
+                from time_conditioning import prepare_online_thinking_time_conditioning
+                thinking_time_emb, thinking_time_mask, _ = prepare_online_thinking_time_conditioning(
                     self,
                     inputs_embeds.shape[0],
                     inputs_embeds.device,
@@ -673,8 +684,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
-                    time_emb,
-                    time_mask,
+                    thinking_time_emb,
+                    thinking_time_mask,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -686,8 +697,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    time_emb=time_emb,
-                    time_mask=time_mask,
+                    thinking_time_emb=thinking_time_emb,
+                    thinking_time_mask=thinking_time_mask,
                     **flash_attn_kwargs,
                 )
 
@@ -697,18 +708,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
-        # Time conditioning: always run predictor (aux loss during training, cache during rollout)
-        if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
-            _predict_mask = getattr(self, '_gt_time_mask', None)
-            if _predict_mask is not None:
-                self._last_time_pred = self.time_progress_predictor(hidden_states.detach(), thinking_mask=_predict_mask)
-            else:
-                self._last_time_pred = self.time_progress_predictor(hidden_states.detach())
-            if getattr(self, '_gt_time_emb', None) is None:
+        if has_time_conditioning(self):
+            _predict_mask = getattr(self, '_train_thinking_time_mask', None)
+            if _predict_mask is None:
                 # Rollout/inference: cache hidden state for next decode step (only thinking positions)
-                from time_conditioning import update_online_time_conditioning_hidden_cache
+                from time_conditioning import update_online_thinking_time_hidden_cache
                 _new_hidden = hidden_states[:, -1:, :].detach()
-                update_online_time_conditioning_hidden_cache(self, _new_hidden, _is_thinking)
+                update_online_thinking_time_hidden_cache(self, _new_hidden, _is_thinking)
+            else:
+                self._train_predictor_hidden_states = hidden_states.detach()
 
         # add hidden states from the last decoder layer
         if output_hidden_states:

@@ -24,9 +24,14 @@
 #                         experiment dir instead of skipping. Errors if a task's
 #                         experiment dir is missing or contains no checkpoint-*.
 #                         Hyperparameters must match the original run.
-#   --time-cond           Run TGRPO (GRPO + time conditioning, no thinking residual)
-#   --time-loss-weight V  Time conditioning loss weight (default: 0.1)
+#   --mode MODE           Internal override: grpo or tgrpo (default: grpo)
+#   --thinking-time-loss-weight V
+#                         Thinking-time auxiliary loss weight (default: 0.1)
 #   --lr-time-cond V      Learning rate for time conditioning modules (default: 1e-4)
+#   --exp-suffix NAME     Append a suffix to experiment dir names to avoid
+#                         checkpoint collisions with previous runs
+#   --max-steps N         Override trainer max_steps for smoke tests or short runs
+#   --max-train-samples N Limit the loaded training dataset before tokenization
 #   --no-wandb            Disable WandB logging
 #   --prep-data           Run prepare_data.py for selected --tasks before training/eval
 #   --dry-run             Print commands without executing
@@ -68,13 +73,14 @@ NO_WANDB=false
 PREP_DATA=false
 DRY_RUN=false
 RESUME=false
-TIME_CONDITIONING=false
-TIME_LOSS_WEIGHT=0.1
+MODE="grpo"
+THINKING_TIME_LOSS_WEIGHT=0.1
 LR_TIME_CONDITIONING=1e-4
+EXP_SUFFIX=""
+MAX_STEPS=-1
+MAX_TRAIN_SAMPLES=""
 MODE_LABEL="GRPO"
 MODE_LOG_PREFIX="grpo"
-TRAIN_MODE_FLAG="--only_grpo"
-EVAL_MODE_FLAG="--only_grpo"
 FAILED_TASKS=()
 
 # ========================= Argument Parsing ==================================
@@ -98,15 +104,12 @@ while [[ $# -gt 0 ]]; do
         --eval-only)  EVAL_ONLY=true; shift ;;
         --skip-eval)  SKIP_EVAL=true; shift ;;
         --resume)     RESUME=true; shift ;;
-        --time-cond)
-            TIME_CONDITIONING=true
-            MODE_LABEL="TGRPO"
-            MODE_LOG_PREFIX="tgrpo"
-            TRAIN_MODE_FLAG="--tgrpo"
-            EVAL_MODE_FLAG="--tgrpo"
-            shift ;;
-        --time-loss-weight) TIME_LOSS_WEIGHT="$2"; shift 2 ;;
+        --mode)       MODE="$2"; shift 2 ;;
+        --thinking-time-loss-weight) THINKING_TIME_LOSS_WEIGHT="$2"; shift 2 ;;
         --lr-time-cond)     LR_TIME_CONDITIONING="$2"; shift 2 ;;
+        --exp-suffix)       EXP_SUFFIX="$2"; shift 2 ;;
+        --max-steps)        MAX_STEPS="$2"; shift 2 ;;
+        --max-train-samples) MAX_TRAIN_SAMPLES="$2"; shift 2 ;;
         --no-wandb)   NO_WANDB=true; shift ;;
         --prep-data)  PREP_DATA=true; shift ;;
         --dry-run)    DRY_RUN=true; shift ;;
@@ -115,21 +118,54 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+case "$MODE" in
+    grpo)
+        MODE_LABEL="GRPO"
+        MODE_LOG_PREFIX="grpo"
+        ;;
+    tgrpo)
+        MODE_LABEL="TGRPO"
+        MODE_LOG_PREFIX="tgrpo"
+        ;;
+    *)
+        echo "Unsupported mode for run_grpo_all.sh: ${MODE} (expected grpo or tgrpo)"
+        exit 1
+        ;;
+esac
+
+if ! [[ "${MAX_STEPS}" =~ ^-?[0-9]+$ ]]; then
+    echo "Invalid value for --max-steps: ${MAX_STEPS}"
+    exit 1
+fi
+
+if [ -n "${MAX_TRAIN_SAMPLES}" ] && ! [[ "${MAX_TRAIN_SAMPLES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Invalid value for --max-train-samples: ${MAX_TRAIN_SAMPLES}"
+    exit 1
+fi
+
 # ========================= Utility Functions =================================
 log() {
     local task="$1"; shift
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$task] $*"
 }
 
+normalize_exp_suffix() {
+    local raw="$1"
+    raw=$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    raw=$(printf '%s' "$raw" | tr -cs 'A-Za-z0-9._-' '-')
+    raw=$(printf '%s' "$raw" | sed -e 's/^[.-]*//' -e 's/[.-]*$//')
+    printf '%s' "$raw"
+}
+
+EXP_SUFFIX=$(normalize_exp_suffix "$EXP_SUFFIX")
+
 get_exp_name() {
     local task="$1"
     local group_size="$2"
     local model_short="${MODEL##*/}"
-    if [ "$TIME_CONDITIONING" = true ]; then
-        echo "./experiments/${model_short}-${task}-tgrpo-group${group_size}-lora${LORA_RANK}-temp${TEMPERATURE}"
-    else
-        echo "./experiments/${model_short}-${task}-grpo-group${group_size}-lora${LORA_RANK}-temp${TEMPERATURE}"
-    fi
+    local suffix_segment=""
+    [ -n "$EXP_SUFFIX" ] && suffix_segment="-${EXP_SUFFIX}"
+    echo "./experiments/${model_short}-${task}-${MODE}-group${group_size}-lora${LORA_RANK}-temp${TEMPERATURE}${suffix_segment}"
 }
 
 find_latest_checkpoint() {
@@ -173,7 +209,8 @@ check_dataset() {
 
 # Common training args shared by all tasks (GRPO or TGRPO: no residual args)
 common_train_args() {
-    echo "--model_name ${MODEL} \
+    echo "--mode ${MODE} \
+        --model_name ${MODEL} \
         --lora_rank ${LORA_RANK} \
         --lr ${LR} \
         --beta ${BETA} \
@@ -184,7 +221,10 @@ common_train_args() {
         --max_grad_norm ${MAX_GRAD_NORM} \
         --temperature ${TEMPERATURE} \
         --seed ${SEED} \
-        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" )"
+        $( [ "${MAX_STEPS}" -gt 0 ] && echo "--max_steps ${MAX_STEPS}" ) \
+        $( [ -n "${MAX_TRAIN_SAMPLES}" ] && echo "--max_train_samples ${MAX_TRAIN_SAMPLES}" ) \
+        $( [ -n "$EXP_SUFFIX" ] && echo "--exp-suffix ${EXP_SUFFIX}" ) \
+        $( [ "$MODE" = "tgrpo" ] && echo "--thinking_time_loss_weight ${THINKING_TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" )"
 }
 
 # ========================= Conda Activation ==================================
@@ -224,6 +264,14 @@ train_gsm8k() {
             log "$task" "Checkpoint already exists, skipping training (use --resume to continue)"
             return 0
         fi
+    elif [ -d "$exp_name" ] && [ "$(ls -A "$exp_name" 2>/dev/null)" ]; then
+        if [ "$RESUME" = true ]; then
+            log "$task" "ERROR: --resume specified but no checkpoint-* found in ${exp_name}"
+            return 1
+        fi
+        log "$task" "ERROR: Experiment dir exists but contains no checkpoint-* entries: ${exp_name}"
+        log "$task" "ERROR: Clean it manually or use a different --exp-suffix"
+        return 1
     elif [ "$RESUME" = true ]; then
         log "$task" "ERROR: --resume specified but no checkpoint found in ${exp_name}"
         return 1
@@ -233,33 +281,22 @@ train_gsm8k() {
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_gsm8k.py \\"
-        echo "    ${TRAIN_MODE_FLAG}${resume_arg:+ ${resume_arg}} \\"
+        [ -n "$resume_arg" ] && echo "    ${resume_arg} \\"
         echo "    --per_device_train_batch_size ${GSM8K_BS} --gradient_accumulation_steps ${GSM8K_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 1024 --max_completion_length 1024 \\"
         echo "    $(common_train_args)"
         return 0
     fi
 
+    log "$task" "Launch config: max_steps=${MAX_STEPS}, max_train_samples=${MAX_TRAIN_SAMPLES:-all}"
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_gsm8k.py \
-        ${TRAIN_MODE_FLAG} \
         ${resume_arg} \
         --per_device_train_batch_size ${GSM8K_BS} \
         --gradient_accumulation_steps ${GSM8K_GA} \
         --group_size ${group_size} \
         --max_prompt_length 1024 \
         --max_completion_length 1024 \
-        --model_name "${MODEL}" \
-        --lora_rank ${LORA_RANK} \
-        --lr ${LR} \
-        --beta ${BETA} \
-        --weight_decay ${WEIGHT_DECAY} \
-        --warmup_ratio ${WARMUP_RATIO} \
-        --lr_scheduler_type ${LR_SCHEDULER_TYPE} \
-        --optimizer ${OPTIMIZER} \
-        --max_grad_norm ${MAX_GRAD_NORM} \
-        --temperature ${TEMPERATURE} \
-        --seed ${SEED} \
-        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" ) \
+        $(common_train_args) \
         2>&1 | tee "${logfile}"
 }
 
@@ -281,6 +318,14 @@ train_math() {
             log "$task" "Checkpoint already exists, skipping training (use --resume to continue)"
             return 0
         fi
+    elif [ -d "$exp_name" ] && [ "$(ls -A "$exp_name" 2>/dev/null)" ]; then
+        if [ "$RESUME" = true ]; then
+            log "$task" "ERROR: --resume specified but no checkpoint-* found in ${exp_name}"
+            return 1
+        fi
+        log "$task" "ERROR: Experiment dir exists but contains no checkpoint-* entries: ${exp_name}"
+        log "$task" "ERROR: Clean it manually or use a different --exp-suffix"
+        return 1
     elif [ "$RESUME" = true ]; then
         log "$task" "ERROR: --resume specified but no checkpoint found in ${exp_name}"
         return 1
@@ -290,7 +335,7 @@ train_math() {
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_math.py \\"
-        echo "    ${TRAIN_MODE_FLAG}${resume_arg:+ ${resume_arg}} \\"
+        [ -n "$resume_arg" ] && echo "    ${resume_arg} \\"
         echo "    --dataset_root ../MATH \\"
         echo "    --per_device_train_batch_size ${MATH_BS} --gradient_accumulation_steps ${MATH_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 2048 --max_completion_length 2048 \\"
@@ -298,8 +343,8 @@ train_math() {
         return 0
     fi
 
+    log "$task" "Launch config: max_steps=${MAX_STEPS}, max_train_samples=${MAX_TRAIN_SAMPLES:-all}"
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_math.py \
-        ${TRAIN_MODE_FLAG} \
         ${resume_arg} \
         --dataset_root ../MATH \
         --per_device_train_batch_size ${MATH_BS} \
@@ -307,18 +352,7 @@ train_math() {
         --group_size ${group_size} \
         --max_prompt_length 2048 \
         --max_completion_length 2048 \
-        --model_name "${MODEL}" \
-        --lora_rank ${LORA_RANK} \
-        --lr ${LR} \
-        --beta ${BETA} \
-        --weight_decay ${WEIGHT_DECAY} \
-        --warmup_ratio ${WARMUP_RATIO} \
-        --lr_scheduler_type ${LR_SCHEDULER_TYPE} \
-        --optimizer ${OPTIMIZER} \
-        --max_grad_norm ${MAX_GRAD_NORM} \
-        --temperature ${TEMPERATURE} \
-        --seed ${SEED} \
-        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" ) \
+        $(common_train_args) \
         2>&1 | tee "${logfile}"
 }
 
@@ -340,6 +374,14 @@ train_mmlu() {
             log "$task" "Checkpoint already exists, skipping training (use --resume to continue)"
             return 0
         fi
+    elif [ -d "$exp_name" ] && [ "$(ls -A "$exp_name" 2>/dev/null)" ]; then
+        if [ "$RESUME" = true ]; then
+            log "$task" "ERROR: --resume specified but no checkpoint-* found in ${exp_name}"
+            return 1
+        fi
+        log "$task" "ERROR: Experiment dir exists but contains no checkpoint-* entries: ${exp_name}"
+        log "$task" "ERROR: Clean it manually or use a different --exp-suffix"
+        return 1
     elif [ "$RESUME" = true ]; then
         log "$task" "ERROR: --resume specified but no checkpoint found in ${exp_name}"
         return 1
@@ -349,7 +391,7 @@ train_mmlu() {
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_mmlu.py \\"
-        echo "    ${TRAIN_MODE_FLAG}${resume_arg:+ ${resume_arg}} \\"
+        [ -n "$resume_arg" ] && echo "    ${resume_arg} \\"
         echo "    --dataset_root ../MMLU_Train_Merged \\"
         echo "    --per_device_train_batch_size ${MMLU_BS} --gradient_accumulation_steps ${MMLU_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 1024 --max_completion_length 1024 \\"
@@ -357,8 +399,8 @@ train_mmlu() {
         return 0
     fi
 
+    log "$task" "Launch config: max_steps=${MAX_STEPS}, max_train_samples=${MAX_TRAIN_SAMPLES:-all}"
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_mmlu.py \
-        ${TRAIN_MODE_FLAG} \
         ${resume_arg} \
         --dataset_root ../MMLU_Train_Merged \
         --per_device_train_batch_size ${MMLU_BS} \
@@ -366,18 +408,7 @@ train_mmlu() {
         --group_size ${group_size} \
         --max_prompt_length 1024 \
         --max_completion_length 1024 \
-        --model_name "${MODEL}" \
-        --lora_rank ${LORA_RANK} \
-        --lr ${LR} \
-        --beta ${BETA} \
-        --weight_decay ${WEIGHT_DECAY} \
-        --warmup_ratio ${WARMUP_RATIO} \
-        --lr_scheduler_type ${LR_SCHEDULER_TYPE} \
-        --optimizer ${OPTIMIZER} \
-        --max_grad_norm ${MAX_GRAD_NORM} \
-        --temperature ${TEMPERATURE} \
-        --seed ${SEED} \
-        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" ) \
+        $(common_train_args) \
         2>&1 | tee "${logfile}"
 }
 
@@ -399,6 +430,14 @@ train_rag() {
             log "$task" "Checkpoint already exists, skipping training (use --resume to continue)"
             return 0
         fi
+    elif [ -d "$exp_name" ] && [ "$(ls -A "$exp_name" 2>/dev/null)" ]; then
+        if [ "$RESUME" = true ]; then
+            log "$task" "ERROR: --resume specified but no checkpoint-* found in ${exp_name}"
+            return 1
+        fi
+        log "$task" "ERROR: Experiment dir exists but contains no checkpoint-* entries: ${exp_name}"
+        log "$task" "ERROR: Clean it manually or use a different --exp-suffix"
+        return 1
     elif [ "$RESUME" = true ]; then
         log "$task" "ERROR: --resume specified but no checkpoint found in ${exp_name}"
         return 1
@@ -408,7 +447,7 @@ train_rag() {
 
     if [ "$DRY_RUN" = true ]; then
         echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_rag.py \\"
-        echo "    ${TRAIN_MODE_FLAG}${resume_arg:+ ${resume_arg}} \\"
+        [ -n "$resume_arg" ] && echo "    ${resume_arg} \\"
         echo "    --dataset_root ../RAG_Train_Merged \\"
         echo "    --per_device_train_batch_size ${RAG_BS} --gradient_accumulation_steps ${RAG_GA} \\"
         echo "    --group_size ${group_size} --max_prompt_length 2048 --max_completion_length 1024 \\"
@@ -416,8 +455,8 @@ train_rag() {
         return 0
     fi
 
+    log "$task" "Launch config: max_steps=${MAX_STEPS}, max_train_samples=${MAX_TRAIN_SAMPLES:-all}"
     CUDA_VISIBLE_DEVICES=${GPU_ID} python hrpo_rag.py \
-        ${TRAIN_MODE_FLAG} \
         ${resume_arg} \
         --dataset_root ../RAG_Train_Merged \
         --per_device_train_batch_size ${RAG_BS} \
@@ -425,18 +464,7 @@ train_rag() {
         --group_size ${group_size} \
         --max_prompt_length 2048 \
         --max_completion_length 1024 \
-        --model_name "${MODEL}" \
-        --lora_rank ${LORA_RANK} \
-        --lr ${LR} \
-        --beta ${BETA} \
-        --weight_decay ${WEIGHT_DECAY} \
-        --warmup_ratio ${WARMUP_RATIO} \
-        --lr_scheduler_type ${LR_SCHEDULER_TYPE} \
-        --optimizer ${OPTIMIZER} \
-        --max_grad_norm ${MAX_GRAD_NORM} \
-        --temperature ${TEMPERATURE} \
-        --seed ${SEED} \
-        $( [ "$TIME_CONDITIONING" = true ] && echo "--time_conditioning --time_loss_weight ${TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" ) \
+        $(common_train_args) \
         2>&1 | tee "${logfile}"
 }
 
@@ -448,7 +476,7 @@ eval_gsm8k() {
     if [ "$DRY_RUN" = true ]; then
         local ckpt_hint
         ckpt_hint=$(dry_run_checkpoint_hint "$exp_name")
-        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_gsm8k.py ${EVAL_MODE_FLAG} --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_gsm8k.py --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
         return 0
     fi
     local ckpt
@@ -468,7 +496,6 @@ eval_gsm8k() {
     local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_gsm8k_eval_$(date +%Y%m%d_%H%M%S).log"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_gsm8k.py \
-        ${EVAL_MODE_FLAG} \
         --checkpoint_path "${ckpt}" \
         --batch_size ${EVAL_BS} \
         2>&1 | tee "${logfile}"
@@ -481,7 +508,7 @@ eval_math() {
     if [ "$DRY_RUN" = true ]; then
         local ckpt_hint
         ckpt_hint=$(dry_run_checkpoint_hint "$exp_name")
-        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_math.py ${EVAL_MODE_FLAG} --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_math.py --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
         return 0
     fi
     local ckpt
@@ -501,7 +528,6 @@ eval_math() {
     local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_math_eval_$(date +%Y%m%d_%H%M%S).log"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_math.py \
-        ${EVAL_MODE_FLAG} \
         --checkpoint_path "${ckpt}" \
         --batch_size ${EVAL_BS} \
         2>&1 | tee "${logfile}"
@@ -514,7 +540,7 @@ eval_mmlu() {
     if [ "$DRY_RUN" = true ]; then
         local ckpt_hint
         ckpt_hint=$(dry_run_checkpoint_hint "$exp_name")
-        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_mmlust.py ${EVAL_MODE_FLAG} --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_mmlust.py --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
         return 0
     fi
     local ckpt
@@ -534,7 +560,6 @@ eval_mmlu() {
     local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_mmlu_eval_$(date +%Y%m%d_%H%M%S).log"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_mmlust.py \
-        ${EVAL_MODE_FLAG} \
         --checkpoint_path "${ckpt}" \
         --batch_size ${EVAL_BS} \
         2>&1 | tee "${logfile}"
@@ -547,7 +572,7 @@ eval_arcc() {
     if [ "$DRY_RUN" = true ]; then
         local ckpt_hint
         ckpt_hint=$(dry_run_checkpoint_hint "$exp_name")
-        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_arcc.py ${EVAL_MODE_FLAG} --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_arcc.py --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
         return 0
     fi
     local ckpt
@@ -567,7 +592,6 @@ eval_arcc() {
     local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_arcc_eval_$(date +%Y%m%d_%H%M%S).log"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_arcc.py \
-        ${EVAL_MODE_FLAG} \
         --checkpoint_path "${ckpt}" \
         --batch_size ${EVAL_BS} \
         2>&1 | tee "${logfile}"
@@ -580,7 +604,7 @@ eval_rag() {
     if [ "$DRY_RUN" = true ]; then
         local ckpt_hint
         ckpt_hint=$(dry_run_checkpoint_hint "$exp_name")
-        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_rag.py ${EVAL_MODE_FLAG} --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
+        echo "[DRY-RUN] CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_rag.py --checkpoint_path ${ckpt_hint} --batch_size ${EVAL_BS}"
         return 0
     fi
     local ckpt
@@ -623,7 +647,6 @@ eval_rag() {
     local logfile="${LOG_DIR}/${MODE_LOG_PREFIX}_rag_eval_$(date +%Y%m%d_%H%M%S).log"
 
     CUDA_VISIBLE_DEVICES=${GPU_ID} python eval_rag.py \
-        ${EVAL_MODE_FLAG} \
         --checkpoint_path "${ckpt}" \
         --batch_size ${EVAL_BS} \
         2>&1 | tee "${logfile}"
@@ -633,7 +656,7 @@ eval_rag() {
 print_summary() {
     echo ""
     echo "============================================================"
-    if [ "$TIME_CONDITIONING" = true ]; then
+    if [ "$MODE" = "tgrpo" ]; then
         echo "                    TGRPO Pipeline Summary"
     else
         echo "              GRPO Baseline Pipeline Summary"
@@ -642,8 +665,8 @@ print_summary() {
     echo "Model:  ${MODEL}"
     echo "GPU:    ${GPU_ID}"
     echo "Tasks:  ${TASKS}"
-    if [ "$TIME_CONDITIONING" = true ]; then
-        echo "Time conditioning: weight=${TIME_LOSS_WEIGHT}, lr=${LR_TIME_CONDITIONING}"
+    if [ "$MODE" = "tgrpo" ]; then
+        echo "Time conditioning: thinking_time_loss_weight=${THINKING_TIME_LOSS_WEIGHT}, lr=${LR_TIME_CONDITIONING}"
     fi
     echo ""
 
@@ -741,7 +764,7 @@ print(f\"{d['metrics']['accuracy']:.4f}\")
 # ========================= Main ==============================================
 main() {
     log "MAIN" "=========================================="
-    if [ "$TIME_CONDITIONING" = true ]; then
+    if [ "$MODE" = "tgrpo" ]; then
         log "MAIN" "TGRPO Training & Evaluation"
     else
         log "MAIN" "GRPO Baseline Training & Evaluation"
@@ -771,9 +794,11 @@ main() {
     # Activate conda
     activate_env
 
-    # Disable WandB if requested
+    # Disable WandB if requested.
+    # Prefer WANDB_MODE over WANDB_DISABLED to avoid upstream deprecation noise.
     if [ "$NO_WANDB" = true ]; then
-        export WANDB_DISABLED=true
+        unset WANDB_DISABLED
+        export WANDB_MODE=disabled
         log "MAIN" "WandB disabled"
     fi
 

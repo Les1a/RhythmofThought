@@ -1,210 +1,552 @@
-"""
-Time-Conditioned LayerNorm Modulation for HRPO.
+"""Time-conditioning modules and runtime helpers for TGRPO/THRPO."""
 
-Provides modules for predicting reasoning progress, encoding it sinusoidally,
-and modulating RMSNorm layers via per-layer AdaLN with scale (γ), shift (β),
-and gate (α) projections.
-"""
-
-import json
 import math
-import os
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-class TimeProgressPredictor(nn.Module):
-    """Predicts monotonic per-token reasoning progress t ∈ [0,1]."""
+TIME_CONDITIONING_MODULE_NAMES = (
+    "adaln_proj",
+    "thinking_time_predictor",
+    "reasoning_time_embedding",
+)
+THINKING_RESIDUAL_MODULE_NAMES = (
+    "thinking_residual_gate_r",
+    "thinking_residual_gate_i",
+    "thinking_residual_Lambda",
+)
 
-    def __init__(self, hidden_size, delta_eps=1e-6, init_bias=-4.0):
+
+class ThinkingTimePredictor(nn.Module):
+    """Predict per-token thinking time logits independently in [0, 1]."""
+
+    def __init__(self, hidden_size):
         super().__init__()
-        self.delta_eps = float(delta_eps)
+        bottleneck = hidden_size // 4
         self.net = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 4),
+            nn.Linear(hidden_size, bottleneck),
             nn.SiLU(),
-            nn.Linear(hidden_size // 4, 1),
+            nn.Linear(bottleneck, 1),
         )
-        # Start near zero progress increments so early rollout predictions do not
-        # immediately saturate the time embedding.
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.constant_(self.net[-1].bias, float(init_bias))
 
-    def _delta_from_hidden(self, hidden_states):
-        return F.softplus(self.net(hidden_states)).squeeze(-1) + self.delta_eps
+    def _predict_token_thinking_time(self, hidden_states):
+        net_dtype = next(self.net.parameters()).dtype
+        return torch.sigmoid(self.net(hidden_states.to(net_dtype))).squeeze(-1)
 
     def forward(self, inputs_embeds, thinking_mask=None):
-        # inputs_embeds: (B, L, hidden_size)
-        delta = self._delta_from_hidden(inputs_embeds)
+        thinking_time = self._predict_token_thinking_time(inputs_embeds).clamp(0.0, 1.0)
         mask = None
         if thinking_mask is not None:
-            mask = _normalize_sequence_mask(thinking_mask, delta.shape, delta.device)
-            delta = delta * mask.to(delta.dtype)
-        cum = torch.cumsum(delta, dim=1)
-        time = 1.0 - torch.exp(-cum)
+            mask = _normalize_sequence_mask(thinking_mask, thinking_time.shape, thinking_time.device)
         if mask is not None:
-            time = time * mask.to(time.dtype)
-        return time  # (B, L)
+            thinking_time = torch.where(mask, thinking_time, torch.zeros_like(thinking_time))
+        return thinking_time
 
-    def forward_step(self, inputs_embeds, prev_cum=None, is_thinking=None):
-        # inputs_embeds: (B, 1, hidden_size)
+    def forward_step(self, inputs_embeds, is_thinking=None):
         if inputs_embeds.ndim != 3 or inputs_embeds.shape[1] != 1:
             raise ValueError(
                 "forward_step expects inputs_embeds with shape (B, 1, hidden_size), "
                 f"got {tuple(inputs_embeds.shape)}"
             )
-        delta = self._delta_from_hidden(inputs_embeds)
-        if prev_cum is None:
-            prev_cum = torch.zeros_like(delta)
-        else:
-            if prev_cum.shape != delta.shape:
-                raise ValueError(
-                    f"prev_cum shape {tuple(prev_cum.shape)} does not match delta shape {tuple(delta.shape)}"
-                )
-            prev_cum = prev_cum.to(device=delta.device, dtype=delta.dtype)
-        mask = _normalize_step_mask(is_thinking, delta.shape[0], delta.device)
+
+        thinking_time = self._predict_token_thinking_time(inputs_embeds).clamp(0.0, 1.0)
+
+        mask = _normalize_step_mask(is_thinking, thinking_time.shape[0], thinking_time.device)
         if mask is None:
-            mask = torch.ones_like(delta, dtype=torch.bool)
-        next_cum = torch.where(mask, prev_cum + delta, prev_cum)
-        time = 1.0 - torch.exp(-next_cum)
-        time = torch.where(mask, time, torch.zeros_like(time))
-        return time, next_cum
+            return thinking_time
+        return torch.where(mask, thinking_time, torch.zeros_like(thinking_time))
 
 
-class SinusoidalTimeEmbedding(nn.Module):
-    """Sinusoidal encoding of scalar t ∈ [0,1], projected through 2-layer MLP."""
+class ReasoningTimeEmbedding(nn.Module):
+    """Map scalar thinking-time values to compact Fourier features with learnable bandwidth."""
 
-    def __init__(self, time_embed_dim=256):
+    def __init__(
+        self,
+        thinking_time_embed_dim=256,
+        num_frequencies=32,
+        min_frequency=1.0,
+        max_frequency=6.0,
+        thinking_time_std_init=0.05,
+    ):
         super().__init__()
-        self.time_embed_dim = time_embed_dim
-        half_dim = time_embed_dim // 2
-        # Precompute log-spaced frequencies (not trainable)
-        freqs = torch.exp(-math.log(10000.0) * torch.arange(half_dim).float() / half_dim)
-        self.register_buffer("freqs", freqs)
-        # 2-layer MLP to refine the sinusoidal features
+        self.thinking_time_embed_dim = int(thinking_time_embed_dim)
+        self.num_frequencies = int(num_frequencies)
+        self.min_frequency = float(min_frequency)
+        self.max_frequency = float(max_frequency)
+        self.thinking_time_std_init = float(thinking_time_std_init)
+        if self.thinking_time_embed_dim <= 0:
+            raise ValueError(
+                f"thinking_time_embed_dim must be positive, got {self.thinking_time_embed_dim}"
+            )
+        if self.num_frequencies <= 0:
+            raise ValueError(f"num_frequencies must be positive, got {self.num_frequencies}")
+        if self.min_frequency <= 0.0:
+            raise ValueError(f"min_frequency must be positive, got {self.min_frequency}")
+        if self.max_frequency < self.min_frequency:
+            raise ValueError(
+                f"max_frequency must be >= min_frequency, got {self.max_frequency} < {self.min_frequency}"
+            )
+        if self.thinking_time_std_init <= 0.0:
+            raise ValueError(
+                f"thinking_time_std_init must be positive, got {self.thinking_time_std_init}"
+            )
+
+        if self.num_frequencies == 1:
+            frequencies = torch.full((1,), self.min_frequency)
+        else:
+            log_freqs = torch.linspace(
+                math.log(self.min_frequency),
+                math.log(self.max_frequency),
+                steps=self.num_frequencies,
+            )
+            frequencies = log_freqs.exp()
+
+        self.register_buffer("frequencies", frequencies, persistent=False)
+        self.log_thinking_time_std = nn.Parameter(torch.tensor(math.log(self.thinking_time_std_init)))
+        input_dim = 3 + 2 * self.num_frequencies
         self.mlp = nn.Sequential(
-            nn.Linear(time_embed_dim, time_embed_dim * 4),
+            nn.Linear(input_dim, self.thinking_time_embed_dim * 4),
             nn.SiLU(),
-            nn.Linear(time_embed_dim * 4, time_embed_dim),
+            nn.Linear(self.thinking_time_embed_dim * 4, self.thinking_time_embed_dim),
         )
 
-    def forward(self, t):
-        # t: (B, L) scalar time values in [0, 1]
-        # Expand t for broadcasting: (B, L, 1) * (half_dim,) -> (B, L, half_dim)
-        args = t.unsqueeze(-1).float() * self.freqs
-        # Sinusoidal encoding: (B, L, time_embed_dim)
-        embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        # Cast to MLP weight dtype (handles bf16/fp32 mismatch after PEFT wrapping)
-        mlp_dtype = next(self.mlp.parameters()).dtype
-        return self.mlp(embedding.to(mlp_dtype))
+    def thinking_time_std(self):
+        return self.log_thinking_time_std.exp()
+
+    def _build_features(self, thinking_time):
+        thinking_time = thinking_time.float().clamp(0.0, 1.0)
+        sigma = self.thinking_time_std().to(device=thinking_time.device, dtype=thinking_time.dtype)
+        sigma_field = sigma.expand_as(thinking_time)
+        frequencies = self.frequencies.to(device=thinking_time.device, dtype=thinking_time.dtype)
+        angles = thinking_time.unsqueeze(-1) * frequencies
+        attenuation = torch.exp(-0.5 * sigma.square() * frequencies.square())
+        attenuation = attenuation.view(*([1] * thinking_time.ndim), -1)
+        spectral = torch.cat(
+            [
+                attenuation * torch.sin(angles),
+                attenuation * torch.cos(angles),
+            ],
+            dim=-1,
+        )
+        return torch.cat(
+            [
+                thinking_time.unsqueeze(-1),
+                thinking_time.square().unsqueeze(-1),
+                sigma_field.unsqueeze(-1),
+                spectral,
+            ],
+            dim=-1,
+        )
+
+    def _project_embedding(self, embedding):
+        first_param = next(self.mlp.parameters(), None)
+        if first_param is None:
+            return self.mlp(embedding)
+        return self.mlp(embedding.to(first_param.dtype))
+
+    def forward(self, thinking_time):
+        return self._project_embedding(self._build_features(thinking_time))
 
 
 class AdaLNProjection(nn.Module):
-    """Per-layer AdaLN projection: time_emb → (γ1, β1, α1, γ2, β2, α2).
+    """Per-layer AdaLN projection for two norm/residual sites."""
 
-    Produces 3 modulation parameters (scale, shift, gate) for each of the
-    2 LayerNorms in a decoder layer. Zero-initialized so the model starts
-    as identity (AdaLN-Zero).
-    """
-
-    def __init__(self, time_embed_dim, hidden_size):
+    def __init__(
+        self,
+        thinking_time_embed_dim,
+        hidden_size,
+        gamma_cap=0.99,
+        beta_cap=0.99,
+        alpha_cap=0.99,
+    ):
         super().__init__()
-        self.proj = nn.Linear(time_embed_dim, 6 * hidden_size)
+        self.proj = nn.Linear(thinking_time_embed_dim, 6 * hidden_size)
+        self.set_caps(gamma_cap=gamma_cap, beta_cap=beta_cap, alpha_cap=alpha_cap)
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
-        # Gate (α) bias must be 1 for pre-trained model identity:
-        # residual + 1*sublayer = normal pre-trained behavior
-        # Layout: [γ1(D), β1(D), α1(D), γ2(D), β2(D), α2(D)]
-        with torch.no_grad():
-            self.proj.bias[2 * hidden_size : 3 * hidden_size] = 1.0
-            self.proj.bias[5 * hidden_size : 6 * hidden_size] = 1.0
 
-    def forward(self, time_emb):
-        # time_emb: (B, L, time_embed_dim)
-        # Returns 6 tensors each of shape (B, L, hidden_size)
-        return self.proj(time_emb).chunk(6, dim=-1)
+    def set_caps(self, gamma_cap=0.99, beta_cap=0.99, alpha_cap=0.99):
+        self.gamma_cap = max(float(gamma_cap), 0.0)
+        self.beta_cap = max(float(beta_cap), 0.0)
+        self.alpha_cap = max(float(alpha_cap), 0.0)
+
+    @staticmethod
+    def _bound_chunk(chunk, cap):
+        if cap <= 0.0:
+            return torch.zeros_like(chunk)
+        return cap * torch.tanh(chunk / cap)
+
+    def forward(self, thinking_time_emb):
+        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.proj(thinking_time_emb).chunk(6, dim=-1)
+        gamma1 = self._bound_chunk(gamma1, self.gamma_cap)
+        beta1 = self._bound_chunk(beta1, self.beta_cap)
+        alpha1 = self._bound_chunk(alpha1, self.alpha_cap)
+        gamma2 = self._bound_chunk(gamma2, self.gamma_cap)
+        beta2 = self._bound_chunk(beta2, self.beta_cap)
+        alpha2 = self._bound_chunk(alpha2, self.alpha_cap)
+        return gamma1, beta1, alpha1, gamma2, beta2, alpha2
 
 
-def compute_gt_time(thinking_mask):
-    """Compute GT time values for thinking tokens.
+def prepare_adaln_modulation(raw_chunks, thinking_time_mask=None):
+    """Convert raw AdaLN projection chunks into identity-preserving modulation tensors."""
+    if len(raw_chunks) != 6:
+        raise ValueError(f"expected 6 AdaLN chunks, got {len(raw_chunks)}")
+    gamma1, beta1, alpha1, gamma2, beta2, alpha2 = raw_chunks
+    alpha1 = 1.0 + alpha1
+    alpha2 = 1.0 + alpha2
 
-    Args:
-        thinking_mask: (B, N) boolean, True for thinking tokens.
+    if thinking_time_mask is not None:
+        mask = thinking_time_mask.unsqueeze(-1).to(dtype=gamma1.dtype)
+        gamma1, beta1 = gamma1 * mask, beta1 * mask
+        alpha1 = 1.0 + (alpha1 - 1.0) * mask
+        gamma2, beta2 = gamma2 * mask, beta2 * mask
+        alpha2 = 1.0 + (alpha2 - 1.0) * mask
 
-    Returns:
-        (B, N) float tensor. 0 for non-thinking positions,
-        linearly ramps from 1 / n to 1.0 across each sample's thinking span.
-    """
+    return gamma1, beta1, alpha1, gamma2, beta2, alpha2
+
+
+def compute_thinking_time_targets(thinking_mask):
+    """Compute a 0->1 ramp over each sample's active thinking span."""
     mask_f = thinking_mask.float()
     lengths = mask_f.sum(dim=1, keepdim=True).clamp(min=1)
-    ramp = mask_f.cumsum(dim=1) / lengths
-    return ramp.clamp(0, 1) * mask_f  # zero out non-thinking positions
+    cumsum = mask_f.cumsum(dim=1)
+    ramp = (cumsum - mask_f) / (lengths - 1).clamp(min=1)
+    return ramp.clamp(0.0, 1.0) * mask_f
 
 
 def dead_zone_mse(pred, target, margin=0.01):
-    """Dead-zone MSE: zero loss when |pred - target| < margin, quadratic beyond."""
+    """Zero loss inside a small error band, quadratic outside it."""
     error = (pred - target).abs()
     return torch.where(error < margin, torch.zeros_like(error), (error - margin) ** 2)
 
 
-def select_training_time_embedding(
+def compute_thinking_time_aux_weights(rewards):
+    """Convert rewards into non-negative auxiliary weights using direct reward scale."""
+    if rewards is None:
+        return None
+    if not torch.isfinite(rewards).all():
+        raise ValueError("rewards contains non-finite values")
+    rewards = rewards.float()
+    r_max = rewards.max()
+    if r_max > 1.0:
+        rewards = rewards / r_max
+    return rewards.clamp_min(0.0)
+
+
+def summarize_residual_rollout_metrics(embeds_ratio):
+    """Summarize rollout-time residual usage with names that reflect current behavior."""
+    if embeds_ratio is None:
+        return {}
+    if not torch.is_tensor(embeds_ratio):
+        embeds_ratio = torch.tensor(embeds_ratio)
+    embeds_ratio = embeds_ratio.float()
+    active_mask = embeds_ratio < 1.0
+    metrics = {"residual_active_fraction": active_mask.float().mean().item()}
+    if active_mask.any():
+        active_ratio = embeds_ratio[active_mask]
+        metrics["residual_embed_ratio"] = active_ratio.mean().item()
+        metrics["residual_hidden_ratio"] = torch.sqrt((1.0 - active_ratio.square()).clamp_min(0.0)).mean().item()
+    else:
+        metrics["residual_embed_ratio"] = 1.0
+        metrics["residual_hidden_ratio"] = 0.0
+    return metrics
+
+
+TRAINING_REPLAY_NOISE_EPS = 0.01
+
+
+def _sample_training_replay_noisy_gt(gt_thinking_time):
+    noise = torch.empty_like(gt_thinking_time).uniform_(-TRAINING_REPLAY_NOISE_EPS, TRAINING_REPLAY_NOISE_EPS)
+    return (gt_thinking_time + noise).clamp(0.0, 1.0)
+
+
+def select_training_thinking_time_embedding(
     base_model,
-    gt_time_vals,
-    rollout_time_pred,
-    global_step,
-    max_steps,
+    gt_thinking_time,
+    rollout_thinking_time=None,
     thinking_mask=None,
 ):
-    """Build mixed GT / rollout time embeddings for AdaLN during training.
-
-    The rollout mixing coefficient linearly anneals from 0 at step 0 to 1 at
-    ``max_steps``. Rollout predictions are detached, clamped to [0, 1], and
-    mixed only on thinking positions. Non-thinking positions remain zero.
-
-    Args:
-        base_model: Inner model that owns ``sinusoidal_time_embedding``.
-        gt_time_vals: (B, L) GT reasoning progress values.
-        rollout_time_pred: Optional (B, L) rollout-time predictions.
-        global_step: Current completed optimization step.
-        max_steps: Total optimization steps. If <= 0, always uses GT time.
-
-    Returns:
-        Tuple ``(time_emb, mix_alpha, effective_rollout_alpha)`` where
-        ``time_emb`` is ready for AdaLN consumption.
-    """
-    if gt_time_vals.ndim != 2:
-        raise ValueError(f"gt_time_vals must be rank-2 (B, L), got shape {tuple(gt_time_vals.shape)}")
-    if not torch.isfinite(gt_time_vals).all():
-        raise ValueError("gt_time_vals contains non-finite values")
-
-    mix_alpha = 0.0
-    if max_steps is not None and max_steps > 0:
-        mix_alpha = float(global_step) / float(max_steps)
-        mix_alpha = min(max(mix_alpha, 0.0), 1.0)
+    """Build the training-time replay signal from GT thinking time plus fixed noise."""
+    if gt_thinking_time.ndim != 2:
+        raise ValueError(
+            f"gt_thinking_time must be rank-2 (B, L), got shape {tuple(gt_thinking_time.shape)}"
+        )
+    if not torch.isfinite(gt_thinking_time).all():
+        raise ValueError("gt_thinking_time contains non-finite values")
 
     if thinking_mask is None:
-        thinking_mask = gt_time_vals > 0
-    thinking_mask = _normalize_sequence_mask(thinking_mask, gt_time_vals.shape, gt_time_vals.device)
+        thinking_mask = gt_thinking_time > 0
+    thinking_mask = _normalize_sequence_mask(thinking_mask, gt_thinking_time.shape, gt_thinking_time.device)
 
-    if rollout_time_pred is not None:
-        if rollout_time_pred.shape != gt_time_vals.shape:
+    rollout_available = rollout_thinking_time is not None
+    if rollout_available:
+        if rollout_thinking_time.shape != gt_thinking_time.shape:
             raise ValueError(
-                "rollout_time_pred shape does not match gt_time_vals: "
-                f"{tuple(rollout_time_pred.shape)} vs {tuple(gt_time_vals.shape)}"
+                "rollout_thinking_time shape does not match gt_thinking_time: "
+                f"{tuple(rollout_thinking_time.shape)} vs {tuple(gt_thinking_time.shape)}"
             )
-        rollout_time_pred = rollout_time_pred.to(device=gt_time_vals.device, dtype=gt_time_vals.dtype).detach()
-        if not torch.isfinite(rollout_time_pred).all():
-            raise ValueError("rollout_time_pred contains non-finite values")
-        rollout_time_pred = rollout_time_pred.clamp(0.0, 1.0)
+        rollout_thinking_time = rollout_thinking_time.to(
+            device=gt_thinking_time.device,
+            dtype=gt_thinking_time.dtype,
+        ).detach()
+        if not torch.isfinite(rollout_thinking_time).all():
+            raise ValueError("rollout_thinking_time contains non-finite values")
+        rollout_thinking_time = rollout_thinking_time.clamp(0.0, 1.0)
 
-    selected_time = gt_time_vals
-    effective_rollout_alpha = 0.0
-    if rollout_time_pred is not None and mix_alpha > 0.0:
-        selected_time = (1.0 - mix_alpha) * gt_time_vals + mix_alpha * rollout_time_pred
-        effective_rollout_alpha = mix_alpha
-    selected_time = torch.where(thinking_mask, selected_time, torch.zeros_like(selected_time)).clamp(0.0, 1.0)
-    time_emb = base_model.sinusoidal_time_embedding(selected_time.clone())
-    return time_emb, mix_alpha, effective_rollout_alpha
+    config = getattr(base_model, "config", None)
+    try:
+        rollout_margin = max(float(getattr(config, "thinking_time_rollout_trust_margin", 0.05)), 0.0)
+    except (TypeError, ValueError):
+        rollout_margin = 0.05
+    noisy_gt_thinking_time = _sample_training_replay_noisy_gt(gt_thinking_time)
+    mask_float = thinking_mask.float()
+    if rollout_available:
+        rollout_error = (
+            dead_zone_mse(rollout_thinking_time, gt_thinking_time, margin=rollout_margin) * mask_float
+        ).sum(1) / mask_float.sum(1).clamp(min=1)
+    else:
+        rollout_error = torch.zeros(gt_thinking_time.shape[0], device=gt_thinking_time.device, dtype=gt_thinking_time.dtype)
+
+    selected_thinking_time = noisy_gt_thinking_time
+    selected_thinking_time = torch.where(
+        thinking_mask,
+        selected_thinking_time,
+        torch.zeros_like(selected_thinking_time),
+    ).clamp(0.0, 1.0)
+    thinking_time_emb = base_model.reasoning_time_embedding(selected_thinking_time.clone())
+    source_stats = {"thinking_time_rollout_error": rollout_error.mean().item()}
+    return thinking_time_emb, selected_thinking_time, source_stats
+
+
+def prepare_training_thinking_time_conditioning(
+    base_model,
+    thinking_mask,
+    rollout_thinking_time,
+):
+    """Populate the cached training-time AdaLN tensors on the inner decoder model."""
+    if thinking_mask is None:
+        base_model._train_thinking_time_emb = None
+        base_model._train_thinking_time_mask = None
+        return None, {}
+
+    gt_thinking_time = compute_thinking_time_targets(thinking_mask.clone())
+    base_model._train_thinking_time_emb, _, source_stats = select_training_thinking_time_embedding(
+        base_model,
+        gt_thinking_time,
+        rollout_thinking_time,
+        thinking_mask=thinking_mask.clone(),
+    )
+    base_model._train_thinking_time_mask = thinking_mask.clone()
+    return gt_thinking_time, source_stats
+
+
+def prepare_trainer_time_conditioning(
+    base_model,
+    input_ids,
+    thinking_mask,
+    rollout_thinking_time,
+):
+    """Validate position-aligned trainer inputs and populate cached training tensors."""
+    if thinking_mask is None:
+        base_model._train_thinking_time_emb = None
+        base_model._train_thinking_time_mask = None
+        return None, {}
+
+    if not torch.is_tensor(input_ids) or input_ids.ndim != 2:
+        raise ValueError(
+            f"input_ids must be a rank-2 tensor with shape (B, L), got {type(input_ids)}"
+        )
+
+    target_shape = input_ids.shape
+    device = input_ids.device
+    normalized_thinking_mask = _normalize_sequence_mask(thinking_mask, target_shape, device)
+
+    if rollout_thinking_time is not None:
+        if not torch.is_tensor(rollout_thinking_time):
+            rollout_thinking_time = torch.tensor(rollout_thinking_time, device=device)
+        rollout_thinking_time = rollout_thinking_time.to(device=device)
+        if rollout_thinking_time.shape != target_shape:
+            raise ValueError(
+                "rollout_thinking_time shape does not match input_ids shape: "
+                f"{tuple(rollout_thinking_time.shape)} vs {tuple(target_shape)}"
+            )
+
+    return prepare_training_thinking_time_conditioning(
+        base_model,
+        thinking_mask=normalized_thinking_mask,
+        rollout_thinking_time=rollout_thinking_time,
+    )
+
+
+def prepare_time_conditioning_training_step(
+    model,
+    input_ids,
+    thinking_mask,
+    rollout_thinking_time,
+    thinking_time_loss_weight=0.0,
+):
+    """Prepare cached training-time tensors and normalize the trainer-visible mask."""
+    base_model = None
+    gt_thinking_time = None
+    source_stats = {}
+    use_time_conditioning = False
+    if thinking_time_loss_weight > 0 or thinking_mask is not None:
+        base_model = get_time_conditioning_base_model(model)
+        use_time_conditioning = has_time_conditioning(base_model)
+        reset_time_conditioning_state(base_model)
+    if thinking_mask is not None and thinking_mask.shape[1] != input_ids.shape[1]:
+        if use_time_conditioning or thinking_time_loss_weight > 0:
+            raise ValueError(
+                f"time_conditioning: thinking_mask shape {thinking_mask.shape} does not match "
+                f"input_ids shape {input_ids.shape}. This indicates a data pipeline bug."
+            )
+        thinking_mask = None
+    if use_time_conditioning and base_model is not None:
+        gt_thinking_time, source_stats = prepare_trainer_time_conditioning(
+            base_model,
+            input_ids=input_ids,
+            thinking_mask=thinking_mask,
+            rollout_thinking_time=rollout_thinking_time,
+        )
+    return base_model, use_time_conditioning, gt_thinking_time, thinking_mask, source_stats
+
+
+def clear_training_time_conditioning_forward_cache(base_model):
+    """Drop cached training embeddings after the forward pass while keeping replay hidden states for aux loss."""
+    if base_model is None:
+        return
+    base_model._train_thinking_time_emb = None
+    base_model._train_thinking_time_mask = None
+
+
+def build_replay_lagged_predictor_trace(
+    replay_hidden,
+    prompt_mask,
+    thinking_mask,
+):
+    """Reconstruct rollout-equivalent lagged predictor inputs from replay hidden states."""
+    if replay_hidden is None:
+        raise ValueError("replay_hidden must be provided for time_conditioning aux supervision")
+    if replay_hidden.ndim != 3:
+        raise ValueError(
+            "replay_hidden must be rank-3 (B, L, H), "
+            f"got shape {tuple(replay_hidden.shape)}"
+        )
+
+    batch_size, seq_len, _ = replay_hidden.shape
+    lagged_mask = _normalize_sequence_mask(
+        thinking_mask,
+        (batch_size, seq_len),
+        replay_hidden.device,
+    )
+
+    if prompt_mask is None:
+        raise ValueError("prompt_mask must be provided for replay lagged predictor traces")
+    if not torch.is_tensor(prompt_mask):
+        prompt_mask = torch.tensor(prompt_mask, device=replay_hidden.device)
+    prompt_mask = prompt_mask.to(device=replay_hidden.device, dtype=torch.bool)
+    if prompt_mask.ndim != 2 or prompt_mask.shape[0] != batch_size:
+        raise ValueError(
+            "prompt_mask must have shape (B, P), "
+            f"got shape {tuple(prompt_mask.shape)} for batch size {batch_size}"
+        )
+
+    prompt_lengths = prompt_mask.long().sum(dim=1)
+    if (prompt_lengths <= 0).any():
+        raise ValueError("prompt_mask must include at least one prompt token per sample")
+    if (prompt_lengths > seq_len).any():
+        raise ValueError(
+            "prompt_mask describes more prompt tokens than replay_hidden sequence length: "
+            f"{prompt_lengths.tolist()} vs seq_len={seq_len}"
+        )
+
+    lagged_hidden = torch.zeros_like(replay_hidden)
+    for row_idx in range(batch_size):
+        prompt_len = int(prompt_lengths[row_idx].item())
+        carry = replay_hidden[row_idx, prompt_len - 1]
+        for pos_idx in range(prompt_len, seq_len):
+            lagged_hidden[row_idx, pos_idx] = carry
+            if lagged_mask[row_idx, pos_idx]:
+                carry = replay_hidden[row_idx, pos_idx]
+
+    return lagged_hidden, lagged_mask
+
+
+def _predict_thinking_time_from_hidden_trace(
+    predictor,
+    predictor_hidden_input,
+    predictor_step_mask,
+):
+    if isinstance(predictor, ThinkingTimePredictor) or not hasattr(predictor, "forward_step"):
+        return predictor(
+            predictor_hidden_input,
+            thinking_mask=predictor_step_mask,
+        ).clamp(0.0, 1.0)
+
+    preds = []
+    for idx in range(predictor_hidden_input.shape[1]):
+        used_thinking_time = predictor.forward_step(
+            predictor_hidden_input[:, idx : idx + 1, :],
+            is_thinking=predictor_step_mask[:, idx : idx + 1],
+        )
+        preds.append(used_thinking_time)
+    return torch.cat(preds, dim=1).clamp(0.0, 1.0)
+
+
+def compute_thinking_time_aux_loss(
+    base_model,
+    gt_thinking_time,
+    thinking_mask,
+    prompt_mask,
+    rewards=None,
+):
+    """Compute predictor supervision from replay hidden states with rollout-equivalent lagged carry."""
+    if gt_thinking_time is None or thinking_mask is None:
+        return None, {}
+
+    replay_hidden = getattr(base_model, "_train_predictor_hidden_states", None)
+    if replay_hidden is None:
+        raise ValueError("time_conditioning aux requires cached replay hidden states")
+    if replay_hidden.shape[:2] != gt_thinking_time.shape:
+        raise ValueError(
+            "cached replay hidden leading dims do not match gt_thinking_time: "
+            f"{tuple(replay_hidden.shape[:2])} vs {tuple(gt_thinking_time.shape)}"
+        )
+
+    lagged_hidden, lagged_mask = build_replay_lagged_predictor_trace(
+        replay_hidden,
+        prompt_mask=prompt_mask,
+        thinking_mask=thinking_mask,
+    )
+
+    with torch.inference_mode(False):
+        thinking_time_pred = _predict_thinking_time_from_hidden_trace(
+            base_model.thinking_time_predictor,
+            lagged_hidden.clone(),
+            lagged_mask.clone(),
+        )
+
+    mask_bool = lagged_mask.bool() & thinking_mask.bool()
+    mask_float = mask_bool.float()
+    per_token_loss = dead_zone_mse(thinking_time_pred, gt_thinking_time)
+    per_sample_loss = (per_token_loss * mask_float).sum(1) / mask_float.sum(1).clamp(min=1)
+
+    aux_weights = compute_thinking_time_aux_weights(rewards)
+    if aux_weights is None:
+        aux_weights = torch.ones_like(per_sample_loss)
+    aux_weights = aux_weights.to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
+    aux_loss = (per_sample_loss * aux_weights).mean()
+
+    metrics = {
+        "thinking_time_aux_loss": aux_loss.detach().item(),
+        "thinking_time_pred_error": per_sample_loss.mean().detach().item(),
+    }
+    embedding_module = getattr(base_model, "reasoning_time_embedding", None)
+    if embedding_module is not None and hasattr(embedding_module, "thinking_time_std"):
+        metrics["thinking_time_embed_std"] = embedding_module.thinking_time_std().detach().float().item()
+
+    return aux_loss, metrics
 
 
 def get_time_conditioning_base_model(model):
@@ -216,48 +558,77 @@ def get_time_conditioning_base_model(model):
     return model
 
 
-def reset_time_conditioning_state(model, clear_last_time_pred=True):
+def has_time_conditioning(model):
+    """Return whether the resolved model currently owns active time-conditioning modules."""
+    return bool(
+        model is not None
+        and getattr(model, "use_time_conditioning", False)
+        and hasattr(model, "thinking_time_predictor")
+    )
+
+
+def set_thinking_residual_disabled(model, disabled):
+    """Synchronize the runtime thinking-residual toggle across common wrappers."""
+    disabled = bool(disabled)
+    targets = [model, getattr(model, "model", None), get_time_conditioning_base_model(model)]
+    seen = set()
+    for target in targets:
+        if target is None or id(target) in seen:
+            continue
+        setattr(target, "disable_thinking_residual", disabled)
+        seen.add(id(target))
+
+
+def reset_time_conditioning_state(model):
     """Clear cached time-conditioning state to avoid stale rollout leakage."""
     if model is None:
         return
-    attrs = (
-        "_gt_time_emb",
-        "_gt_time_mask",
+    for attr in (
+        "_train_thinking_time_emb",
+        "_train_thinking_time_mask",
+        "_train_predictor_hidden_states",
         "_cached_last_hidden",
-        "_used_time_pred",
-        "_time_progress_cum",
-    )
-    for attr in attrs:
+        "_used_thinking_time",
+    ):
         setattr(model, attr, None)
-    if clear_last_time_pred:
-        model._last_time_pred = None
 
 
-def prepare_online_time_conditioning(base_model, batch_size, device, is_thinking=None):
-    """Build rollout-time embeddings from cached hidden state and cumulative progress."""
-    used_time_pred = torch.zeros(batch_size, 1, device=device)
-    time_emb = None
-    time_mask = _normalize_step_mask(is_thinking, batch_size, device)
+def prepare_online_thinking_time_conditioning(base_model, batch_size, device, is_thinking=None):
+    """Build one-step-lag rollout conditioning from cached hidden states only."""
+    used_thinking_time = torch.zeros(batch_size, 1, device=device)
+    thinking_time_emb = None
+    thinking_time_mask = _normalize_step_mask(is_thinking, batch_size, device)
     cached_hidden = getattr(base_model, "_cached_last_hidden", None)
-    prev_cum = getattr(base_model, "_time_progress_cum", None)
-    if prev_cum is not None and prev_cum.shape != (batch_size, 1):
-        prev_cum = None
-        base_model._time_progress_cum = None
+
+    if thinking_time_mask is None and cached_hidden is None:
+        base_model._used_thinking_time = used_thinking_time
+        return None, None, used_thinking_time
+
+    active_mask = thinking_time_mask
+    if active_mask is None:
+        active_mask = torch.ones(batch_size, 1, device=device, dtype=torch.bool)
+
     if cached_hidden is not None and cached_hidden.shape[:2] == (batch_size, 1):
         with torch.no_grad():
-            used_time_pred, next_cum = base_model.time_progress_predictor.forward_step(
+            predicted_thinking_time = base_model.thinking_time_predictor.forward_step(
                 cached_hidden,
-                prev_cum=prev_cum,
                 is_thinking=is_thinking,
             )
-            base_model._time_progress_cum = next_cum.detach()
-            time_emb = base_model.sinusoidal_time_embedding(used_time_pred)
-    base_model._used_time_pred = used_time_pred
-    return time_emb, time_mask, used_time_pred
+        used_thinking_time = predicted_thinking_time.clamp(0.0, 1.0)
+        if active_mask.any():
+            thinking_time_emb = base_model.reasoning_time_embedding(used_thinking_time.clone())
+            thinking_time_mask = active_mask
+        else:
+            thinking_time_mask = None
+    else:
+            thinking_time_mask = None
+
+    base_model._used_thinking_time = used_thinking_time.detach()
+    return thinking_time_emb, thinking_time_mask, used_thinking_time
 
 
-def update_online_time_conditioning_hidden_cache(base_model, new_hidden, is_thinking=None):
-    """Update the one-step-lag hidden cache, freezing stopped samples."""
+def update_online_thinking_time_hidden_cache(base_model, new_hidden, is_thinking=None):
+    """Update the one-step-lag hidden cache while freezing rows that finished thinking."""
     old_hidden = getattr(base_model, "_cached_last_hidden", None)
     mask = _normalize_step_mask(is_thinking, new_hidden.shape[0], new_hidden.device)
     if mask is not None and old_hidden is not None and old_hidden.shape == new_hidden.shape:
@@ -291,58 +662,67 @@ def _normalize_step_mask(is_thinking, batch_size, device):
 
 
 def enable_time_conditioning(model):
-    """Dynamically create and attach time conditioning modules to a loaded model.
-
-    Call after FastLanguageModel.from_pretrained() and before get_peft_model().
-    The model.__init__ won't create these modules unless config.use_time_conditioning
-    is set, so this function handles post-hoc creation.
-
-    Args:
-        model: The top-level CausalLM (e.g. from FastLanguageModel.from_pretrained).
-    """
+    """Attach time-conditioning modules to a loaded base model before LoRA wrapping."""
     inner = get_time_conditioning_base_model(model)
     config = inner.config
-    _te_dim = getattr(config, 'time_embed_dim', 256)
+
+    def _read_non_negative_float(attr_name, default):
+        try:
+            return max(float(getattr(config, attr_name, default)), 0.0)
+        except (TypeError, ValueError):
+            return default
+
+    thinking_time_embed_dim = getattr(config, "thinking_time_embed_dim", 256)
+    thinking_time_num_frequencies = getattr(config, "thinking_time_num_frequencies", 32)
+    thinking_time_min_frequency = getattr(config, "thinking_time_min_frequency", 1.0)
+    thinking_time_max_frequency = getattr(config, "thinking_time_max_frequency", 6.0)
+    thinking_time_std_init = getattr(config, "thinking_time_std_init", 0.05)
+    thinking_time_rollout_trust_margin = _read_non_negative_float("thinking_time_rollout_trust_margin", 0.05)
+    thinking_time_gamma_cap = _read_non_negative_float("thinking_time_gamma_cap", 0.99)
+    thinking_time_beta_cap = _read_non_negative_float("thinking_time_beta_cap", 0.99)
+    thinking_time_alpha_cap = _read_non_negative_float("thinking_time_alpha_cap", 0.99)
     device = next(inner.parameters()).device
     dtype = next(inner.parameters()).dtype
 
-    # Per-layer AdaLN
     for layer in inner.layers:
-        if not hasattr(layer, 'adaln_proj'):
+        if not hasattr(layer, "adaln_proj"):
             layer.adaln_proj = AdaLNProjection(
-                time_embed_dim=_te_dim, hidden_size=config.hidden_size
+                thinking_time_embed_dim=thinking_time_embed_dim,
+                hidden_size=config.hidden_size,
+                gamma_cap=thinking_time_gamma_cap,
+                beta_cap=thinking_time_beta_cap,
+                alpha_cap=thinking_time_alpha_cap,
             ).to(device=device, dtype=dtype)
+        else:
+            layer.adaln_proj.set_caps(
+                gamma_cap=thinking_time_gamma_cap,
+                beta_cap=thinking_time_beta_cap,
+                alpha_cap=thinking_time_alpha_cap,
+            )
 
-    # Model-level modules
-    if not hasattr(inner, 'time_progress_predictor'):
-        inner.time_progress_predictor = TimeProgressPredictor(
-            config.hidden_size
-        ).to(device=device, dtype=dtype)
-    if not hasattr(inner, 'sinusoidal_time_embedding'):
-        inner.sinusoidal_time_embedding = SinusoidalTimeEmbedding(
-            time_embed_dim=_te_dim
-        ).to(device=device, dtype=dtype)
+    if not hasattr(inner, "thinking_time_predictor"):
+        inner.thinking_time_predictor = ThinkingTimePredictor(config.hidden_size).to(device=device, dtype=dtype)
+    if not hasattr(inner, "reasoning_time_embedding"):
+        inner.reasoning_time_embedding = ReasoningTimeEmbedding(
+            thinking_time_embed_dim=thinking_time_embed_dim,
+            num_frequencies=thinking_time_num_frequencies,
+            min_frequency=thinking_time_min_frequency,
+            max_frequency=thinking_time_max_frequency,
+            thinking_time_std_init=thinking_time_std_init,
+        ).to(
+            device=device,
+            dtype=dtype,
+        )
+
     inner.use_time_conditioning = True
+    config.use_time_conditioning = True
+    config.thinking_time_embed_dim = thinking_time_embed_dim
+    config.thinking_time_num_frequencies = thinking_time_num_frequencies
+    config.thinking_time_min_frequency = thinking_time_min_frequency
+    config.thinking_time_max_frequency = thinking_time_max_frequency
+    config.thinking_time_std_init = thinking_time_std_init
+    config.thinking_time_rollout_trust_margin = float(thinking_time_rollout_trust_margin)
+    config.thinking_time_gamma_cap = float(thinking_time_gamma_cap)
+    config.thinking_time_beta_cap = float(thinking_time_beta_cap)
+    config.thinking_time_alpha_cap = float(thinking_time_alpha_cap)
     reset_time_conditioning_state(inner)
-
-
-def detect_time_conditioning(model, adapter_path):
-    """Auto-detect and enable time conditioning from a saved adapter checkpoint.
-
-    Reads adapter_config.json to check if 'adaln_proj' is in modules_to_save.
-    If so, creates the time conditioning modules (via enable_time_conditioning)
-    so that load_adapter() can restore the saved weights.
-
-    Call after from_pretrained() but before load_adapter().
-
-    Args:
-        model: The top-level CausalLM.
-        adapter_path: Path to the adapter checkpoint directory.
-    """
-    cfg_path = os.path.join(adapter_path, 'adapter_config.json')
-    if os.path.exists(cfg_path):
-        with open(cfg_path) as f:
-            acfg = json.load(f)
-        modules_to_save = acfg.get('modules_to_save') or []
-        if 'adaln_proj' in modules_to_save:
-            enable_time_conditioning(model)

@@ -174,7 +174,7 @@ def LlamaAttention_fast_forward_inference(
     seq_len = K1.shape[-2]
     kv_seq_len = seq_len + 1
 
-    # Prefill phase
+    # Prefill stage
     # if not hasattr(self, "paged_attention"):
     device = hidden_states.device
     if do_prefill:
@@ -517,16 +517,14 @@ def LlamaDecoderLayer_fast_forward(
         past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
     """
     # Time conditioning: per-layer AdaLN (with optional mask for training)
-    time_emb = kwargs.get('time_emb')
-    time_mask = kwargs.get('time_mask')
-    if time_emb is not None and hasattr(self, 'adaln_proj'):
-        _g1, _b1, _a1, _g2, _b2, _a2 = self.adaln_proj(time_emb)
-        if time_mask is not None:
-            _m = time_mask.unsqueeze(-1).to(dtype=_g1.dtype)
-            _g1, _b1 = _g1 * _m, _b1 * _m
-            _a1 = 1.0 + (_a1 - 1.0) * _m
-            _g2, _b2 = _g2 * _m, _b2 * _m
-            _a2 = 1.0 + (_a2 - 1.0) * _m
+    thinking_time_emb = kwargs.get('thinking_time_emb')
+    thinking_time_mask = kwargs.get('thinking_time_mask')
+    if thinking_time_emb is not None and hasattr(self, 'adaln_proj'):
+        from time_conditioning import prepare_adaln_modulation
+        _g1, _b1, _a1, _g2, _b2, _a2 = prepare_adaln_modulation(
+            self.adaln_proj(thinking_time_emb),
+            thinking_time_mask=thinking_time_mask,
+        )
     else:
         _g1 = _b1 = _a1 = _g2 = _b2 = _a2 = None
 
@@ -786,18 +784,19 @@ def LlamaModel_fast_forward(
     hidden_states = inputs_embeds
 
     # Time conditioning: dual mode (GT for training, predictor for rollout/inference)
-    _time_emb = None
-    _time_mask = None
-    if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
-        _gt = getattr(self, '_gt_time_emb', None)
+    _thinking_time_emb = None
+    _thinking_time_mask = None
+    from time_conditioning import has_time_conditioning
+    if has_time_conditioning(self):
+        _gt = getattr(self, '_train_thinking_time_emb', None)
         if _gt is not None:
-            # GT mode (training): use pre-computed time embeddings
-            _time_emb = _gt
-            _time_mask = getattr(self, '_gt_time_mask', None)
+            # GT mode (training): use pre-computed thinking-time embeddings
+            _thinking_time_emb = _gt
+            _thinking_time_mask = getattr(self, '_train_thinking_time_mask', None)
         else:
             # Predictor mode (rollout/inference)
-            from time_conditioning import prepare_online_time_conditioning
-            _time_emb, _time_mask, _ = prepare_online_time_conditioning(
+            from time_conditioning import prepare_online_thinking_time_conditioning
+            _thinking_time_emb, _thinking_time_mask, _ = prepare_online_thinking_time_conditioning(
                 self,
                 inputs_embeds.shape[0],
                 inputs_embeds.device,
@@ -923,7 +922,15 @@ def LlamaModel_fast_forward(
                     *_base, _te, _tm = inputs
                     _te = _te if _te.numel() > 0 else None
                     _tm = _tm if _tm.numel() > 0 else None
-                    return module(*_base, past_key_value, output_attentions, padding_mask = padding_mask, position_embeddings = position_embeddings, time_emb = _te, time_mask = _tm)
+                    return module(
+                        *_base,
+                        past_key_value,
+                        output_attentions,
+                        padding_mask=padding_mask,
+                        position_embeddings=position_embeddings,
+                        thinking_time_emb=_te,
+                        thinking_time_mask=_tm,
+                    )
                 return custom_forward
             pass
             layer_outputs = torch.utils.checkpoint.checkpoint(
@@ -932,8 +939,8 @@ def LlamaModel_fast_forward(
                 mask,
                 attention_mask,
                 position_ids,
-                _time_emb if _time_emb is not None else torch.empty(0, device=hidden_states.device),
-                _time_mask if _time_mask is not None else torch.empty(0, device=hidden_states.device),
+                _thinking_time_emb if _thinking_time_emb is not None else torch.empty(0, device=hidden_states.device),
+                _thinking_time_mask if _thinking_time_mask is not None else torch.empty(0, device=hidden_states.device),
                 use_reentrant = True,
                 preserve_rng_state = False,
             )
@@ -950,8 +957,8 @@ def LlamaModel_fast_forward(
                 use_cache           = use_cache,
                 padding_mask        = padding_mask,
                 position_embeddings = position_embeddings,
-                time_emb            = _time_emb,
-                time_mask           = _time_mask,
+                thinking_time_emb   = _thinking_time_emb,
+                thinking_time_mask  = _thinking_time_mask,
             )
             hidden_states = layer_outputs[0]
         pass
@@ -970,18 +977,15 @@ def LlamaModel_fast_forward(
     else:
         hidden_states = fast_rms_layernorm(self.norm, hidden_states, gemma = IS_GEMMA)
     pass
-    # Time conditioning: always run predictor (aux loss during training, cache during rollout)
-    if getattr(self, 'use_time_conditioning', False) and hasattr(self, 'time_progress_predictor'):
-        _predict_mask = getattr(self, '_gt_time_mask', None)
-        if _predict_mask is not None:
-            self._last_time_pred = self.time_progress_predictor(hidden_states.detach(), thinking_mask=_predict_mask)
-        else:
-            self._last_time_pred = self.time_progress_predictor(hidden_states.detach())
-        if getattr(self, '_gt_time_emb', None) is None:
+    if has_time_conditioning(self):
+        _predict_mask = getattr(self, '_train_thinking_time_mask', None)
+        if _predict_mask is None:
             # Rollout/inference: cache hidden state for next decode step (only thinking positions)
-            from time_conditioning import update_online_time_conditioning_hidden_cache
+            from time_conditioning import update_online_thinking_time_hidden_cache
             _new_hidden = hidden_states[:, -1:, :].detach()
-            update_online_time_conditioning_hidden_cache(self, _new_hidden, kwargs.get('is_thinking', None))
+            update_online_thinking_time_hidden_cache(self, _new_hidden, kwargs.get('is_thinking', None))
+        else:
+            self._train_predictor_hidden_states = hidden_states.detach()
 
     if output_hidden_states: all_hidden_states += (hidden_states,)
     next_cache = next_decoder_cache if use_cache else None
@@ -1006,6 +1010,8 @@ def LlamaModel_fast_forward_inference(
     attention_mask = None,
     *args, **kwargs,
 ):
+    from time_conditioning import has_time_conditioning
+
     input_ids = input_ids[:,:self.max_seq_length]
     bsz, q_len = input_ids.shape
     hd = self.config.hidden_size
@@ -1014,14 +1020,14 @@ def LlamaModel_fast_forward_inference(
     X = self.model.embed_tokens(input_ids)
     X = X.to(_get_dtype(self.config.torch_dtype))
 
-    # Time conditioning: use CACHED hidden state from previous decode step
+    # Time conditioning: use only the cached hidden state from the previous decode step
     # Short-circuit: skip TC entirely once all batch elements have stopped thinking
-    _time_emb_inf = None
+    _thinking_time_emb_inf = None
     is_thinking = kwargs.get('is_thinking')
-    if getattr(self.model, 'use_time_conditioning', False) and hasattr(self.model, 'time_progress_predictor'):
+    if has_time_conditioning(self.model):
         if is_thinking is None or any(is_thinking):
-            from time_conditioning import prepare_online_time_conditioning
-            _time_emb_inf, _, _ = prepare_online_time_conditioning(
+            from time_conditioning import prepare_online_thinking_time_conditioning
+            _thinking_time_emb_inf, _, _ = prepare_online_thinking_time_conditioning(
                 self.model,
                 X.shape[0],
                 X.device,
@@ -1029,7 +1035,7 @@ def LlamaModel_fast_forward_inference(
             )
         else:
             # All thinking stopped: zero out so stale predictions are not collected
-            self.model._used_time_pred = torch.zeros(X.shape[0], 1, device=X.device)
+            self.model._used_thinking_time = torch.zeros(X.shape[0], 1, device=X.device)
 
     last_thinking_states = kwargs.get('last_thinking_states')
     thinking_embeds = None
@@ -1046,8 +1052,12 @@ def LlamaModel_fast_forward_inference(
 
     # Gate time conditioning by is_thinking during decode
     _tc_mask_inf = None
-    if _time_emb_inf is not None and is_thinking is not None:
-        _tc_mask_inf = torch.tensor(is_thinking, dtype=_time_emb_inf.dtype, device=_time_emb_inf.device).view(-1, 1, 1)
+    if _thinking_time_emb_inf is not None and is_thinking is not None:
+        _tc_mask_inf = torch.tensor(
+            is_thinking,
+            dtype=_thinking_time_emb_inf.dtype,
+            device=_thinking_time_emb_inf.device,
+        ).view(-1, 1, 1)
 
     bsz, q_len, hd = X.shape
     assert(q_len == 1)
@@ -1076,13 +1086,13 @@ def LlamaModel_fast_forward_inference(
 
     for idx, decoder_layer in enumerate(self.model.layers):
         # Per-layer AdaLN for decode (gated by is_thinking)
-        if _time_emb_inf is not None and hasattr(decoder_layer, 'adaln_proj'):
-            _dg1, _db1, _da1, _dg2, _db2, _da2 = decoder_layer.adaln_proj(_time_emb_inf)
-            if _tc_mask_inf is not None:
-                _dg1, _db1 = _dg1 * _tc_mask_inf, _db1 * _tc_mask_inf
-                _da1 = 1.0 + (_da1 - 1.0) * _tc_mask_inf
-                _dg2, _db2 = _dg2 * _tc_mask_inf, _db2 * _tc_mask_inf
-                _da2 = 1.0 + (_da2 - 1.0) * _tc_mask_inf
+        if _thinking_time_emb_inf is not None and hasattr(decoder_layer, 'adaln_proj'):
+            from time_conditioning import prepare_adaln_modulation
+
+            _dg1, _db1, _da1, _dg2, _db2, _da2 = prepare_adaln_modulation(
+                decoder_layer.adaln_proj(_thinking_time_emb_inf),
+                thinking_time_mask=_tc_mask_inf.squeeze(-1) if _tc_mask_inf is not None else None,
+            )
         else:
             _dg1 = _db1 = _da1 = _dg2 = _db2 = _da2 = None
 
@@ -1145,24 +1155,21 @@ def LlamaModel_fast_forward_inference(
         XX2 = XX2,
         variance = variance,
     )
-    # Time conditioning: predict from current hidden states and cache for next decode step
-    # Only update cache for thinking elements; freeze cache once is_thinking=False
-    # Short-circuit: skip entirely once all batch elements have stopped thinking
-    if getattr(self.model, 'use_time_conditioning', False) and hasattr(self.model, 'time_progress_predictor'):
+    if has_time_conditioning(self.model):
         if is_thinking is None or any(is_thinking):
-            self.model._last_time_pred = self.model.time_progress_predictor(X.detach())
-            from time_conditioning import update_online_time_conditioning_hidden_cache
+            from time_conditioning import update_online_thinking_time_hidden_cache
             _new_hidden = X[:, -1:, :].detach()
-            update_online_time_conditioning_hidden_cache(self.model, _new_hidden, is_thinking)
+            update_online_thinking_time_hidden_cache(self.model, _new_hidden, is_thinking)
 
-    _tc_enabled = bool(
-        getattr(self.model, 'use_time_conditioning', False)
-        and hasattr(self.model, 'time_progress_predictor')
+    _tc_enabled = has_time_conditioning(self.model)
+    _used_thinking_time = getattr(
+        self.model,
+        '_used_thinking_time',
+        torch.zeros(X.shape[0], 1, device=X.device),
     )
-    _used_tp = getattr(self.model, '_used_time_pred', torch.zeros(X.shape[0], 1, device=X.device))
     _hidden_states = None
     if is_thinking is not None:
-        _hidden_states = [thinking_embeds, is_thinking, embeds_ratio, _used_tp] if _tc_enabled \
+        _hidden_states = [thinking_embeds, is_thinking, embeds_ratio, _used_thinking_time] if _tc_enabled \
             else [thinking_embeds, is_thinking, embeds_ratio]
     return BaseModelOutputWithPast(
         last_hidden_state = X,
@@ -2479,7 +2486,7 @@ class FastLlamaModel:
 
         # Check modules_to_save
         _TIME_COND_MODULES = frozenset((
-            "time_progress_predictor", "sinusoidal_time_embedding",
+            "thinking_time_predictor", "reasoning_time_embedding",
             "adaln_proj",
         ))
         train_time_conditioning = False
@@ -2612,6 +2619,8 @@ class FastLlamaModel:
                 new_dtype = model.get_input_embeddings().weight.dtype
             except:
                 new_dtype = model.get_input_embeddings().modules_to_save.default.weight.dtype
+            if new_dtype == torch.float16:
+                new_dtype = torch.float32
 
             for module in modules_to_save:
                 if "thinking_residual_gate_r" in module:
@@ -2635,9 +2644,11 @@ class FastLlamaModel:
                 new_dtype = model.get_input_embeddings().weight.dtype
             except:
                 new_dtype = model.get_input_embeddings().modules_to_save.default.weight.dtype
+            if new_dtype == torch.float16:
+                new_dtype = torch.float32
 
             _inner = model.model.model  # PeftModel -> LoraModel -> CausalLM -> inner model
-            for mod_name in ("time_progress_predictor", "sinusoidal_time_embedding"):
+            for mod_name in ("thinking_time_predictor", "reasoning_time_embedding"):
                 mod = getattr(_inner, mod_name, None)
                 if mod is not None and hasattr(mod, "modules_to_save"):
                     mod.modules_to_save.default.to(device="cuda", dtype=new_dtype, non_blocking=True)

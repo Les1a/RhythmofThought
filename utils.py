@@ -1,40 +1,455 @@
+import argparse
+import json
+import os
 import re
 import string
+import types
 from math_verify import parse, verify
 
 
 ANSWER_START = "####"
-
-BASE_MODELS = [
-    "Qwen/Qwen2.5-1.5B-Instruct", "Qwen/Qwen2.5-3B-Instruct",
-    "meta-llama/Llama-3.2-1B-Instruct", "meta-llama/Llama-3.2-3B-Instruct",
-]
-
-
-def detect_temperature(checkpoint_path):
-    """Extract temperature from checkpoint path, handling suffixes like -tcond."""
-    import re
-    m = re.search(r'-temp([0-9.]+)', checkpoint_path)
-    return float(m.group(1)) if m else 0.5
+ADAPTER_CONFIG_NAME = "adapter_config.json"
+ADAPTER_METADATA_KEY = "rot_metadata"
+ADAPTER_METADATA_SCHEMA_VERSION = 1
+TRAINING_MODES = frozenset({"grpo", "tgrpo", "thrpo", "hrpo"})
 
 
-def detect_base_model(checkpoint_path, base_models=None):
-    if base_models is None:
-        base_models = BASE_MODELS
-    for model in base_models:
-        if model.split('/')[-1] in checkpoint_path:
-            return model
+def normalize_exp_suffix(suffix: str | None) -> str:
+    if suffix is None:
+        return ""
+    suffix = suffix.strip()
+    if not suffix:
+        return ""
+    suffix = re.sub(r"[^A-Za-z0-9._-]+", "-", suffix)
+    return suffix.strip("-.")
+
+
+def is_wandb_disabled() -> bool:
+    return (
+        os.environ.get("WANDB_DISABLED", "").lower() == "true"
+        or os.environ.get("WANDB_MODE", "").lower() == "disabled"
+    )
+
+
+def _require_training_mode(mode: str) -> str:
+    if mode not in TRAINING_MODES:
+        raise ValueError(f"unknown training mode: {mode}")
+    return mode
+
+
+def mode_uses_time_conditioning(mode: str) -> bool:
+    return _require_training_mode(mode) in {"tgrpo", "thrpo"}
+
+
+def mode_uses_thinking_residual(mode: str) -> bool:
+    return _require_training_mode(mode) in {"hrpo", "thrpo"}
+
+
+def build_training_exp_name(
+    model_name,
+    task,
+    mode,
+    group_size,
+    lora_rank,
+    temperature,
+    residual_r_min=None,
+    exp_suffix="",
+):
+    mode = _require_training_mode(mode)
+
+    parts = [
+        model_name.split("/")[-1],
+        task,
+        mode,
+        f"group{group_size}",
+        f"lora{lora_rank}",
+    ]
+    if mode in {"thrpo", "hrpo"}:
+        if residual_r_min is None:
+            raise ValueError(f"residual_r_min is required for mode={mode}")
+        parts.append(f"rmin{residual_r_min}")
+    parts.append(f"temp{temperature}")
+
+    exp_suffix = normalize_exp_suffix(exp_suffix)
+    if exp_suffix:
+        parts.append(exp_suffix)
+
+    return "./experiments/" + "-".join(parts)
+
+
+def resolve_resume_from_checkpoint(exp_name: str, resume: bool) -> str | None:
+    if resume:
+        if not os.path.exists(exp_name):
+            raise ValueError(f"--resume specified but {exp_name} does not exist.")
+        from transformers.trainer_utils import get_last_checkpoint
+
+        checkpoint = get_last_checkpoint(exp_name)
+        if checkpoint is None:
+            raise ValueError(f"--resume specified but no checkpoint-* dirs found in {exp_name}.")
+        return checkpoint
+
+    if os.path.exists(exp_name) and os.listdir(exp_name):
+        raise ValueError(f"Experiment {exp_name} already exists.")
     return None
 
 
+def build_adapter_metadata(args, task: str, mode: str) -> dict:
+    mode = _require_training_mode(mode)
+    use_time_conditioning = mode_uses_time_conditioning(mode)
+    use_thinking_residual = mode_uses_thinking_residual(mode)
+    return {
+        "schema_version": ADAPTER_METADATA_SCHEMA_VERSION,
+        "task": task,
+        "mode": mode,
+        "base_model": args.model_name,
+        "temperature": float(args.temperature),
+        "group_size": int(args.group_size),
+        "lora_rank": int(args.lora_rank),
+        "max_prompt_length": int(args.max_prompt_length),
+        "max_completion_length": int(args.max_completion_length),
+        "use_thinking_residual": use_thinking_residual,
+        "use_time_conditioning": use_time_conditioning,
+        "residual_r_min": float(args.residual_r_min),
+        "residual_r_max": float(args.residual_r_max),
+        "thinking_time_loss_weight": float(args.thinking_time_loss_weight) if use_time_conditioning else 0.0,
+        "lr": float(args.lr),
+        "lr_residual_gate": float(args.lr_residual_gate) if use_thinking_residual else None,
+        "lr_residual_lambda": float(args.lr_residual_Lambda) if use_thinking_residual else None,
+        "lr_time_conditioning": float(args.lr_time_conditioning) if use_time_conditioning else None,
+    }
+
+
+def attach_adapter_metadata(model, metadata: dict) -> None:
+    peft_config = getattr(model, "peft_config", None)
+    if peft_config is None:
+        raise ValueError("model does not expose peft_config for adapter metadata attachment")
+
+    metadata = dict(metadata)
+    configs = peft_config.values() if isinstance(peft_config, dict) else [peft_config]
+    for config in configs:
+        if getattr(config, "_rot_original_to_dict", None) is None:
+            config._rot_original_to_dict = config.to_dict
+
+            def _to_dict_with_metadata(self):
+                output = self._rot_original_to_dict()
+                output[ADAPTER_METADATA_KEY] = dict(self._rot_metadata)
+                return output
+
+            config.to_dict = types.MethodType(_to_dict_with_metadata, config)
+        config._rot_metadata = metadata
+
+
+def load_adapter_metadata(adapter_path: str) -> dict:
+    config_path = os.path.join(adapter_path, ADAPTER_CONFIG_NAME)
+    if not os.path.exists(config_path):
+        raise ValueError(f"{config_path} does not exist")
+
+    with open(config_path) as handle:
+        adapter_config = json.load(handle)
+
+    metadata = adapter_config.get(ADAPTER_METADATA_KEY)
+    if not isinstance(metadata, dict):
+        raise ValueError(f"{config_path} does not contain {ADAPTER_METADATA_KEY}")
+
+    schema_version = int(metadata.get("schema_version", -1))
+    if schema_version != ADAPTER_METADATA_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported adapter metadata schema_version={schema_version}; "
+            f"expected {ADAPTER_METADATA_SCHEMA_VERSION}"
+        )
+
+    normalized = dict(metadata)
+    normalized["mode"] = _require_training_mode(normalized.get("mode"))
+    if not normalized.get("base_model"):
+        raise ValueError(f"{config_path} is missing {ADAPTER_METADATA_KEY}.base_model")
+    normalized["temperature"] = float(normalized.get("temperature", 0.5))
+    return normalized
+
+
+def get_modules_to_save_for_mode(mode: str):
+    """Return the PEFT `modules_to_save` list for the selected training mode."""
+    mode = _require_training_mode(mode)
+    if mode == "grpo":
+        return None
+
+    from time_conditioning import THINKING_RESIDUAL_MODULE_NAMES, TIME_CONDITIONING_MODULE_NAMES
+
+    modules_to_save = []
+    if mode_uses_thinking_residual(mode):
+        modules_to_save.extend(THINKING_RESIDUAL_MODULE_NAMES)
+    if mode_uses_time_conditioning(mode):
+        modules_to_save.extend(TIME_CONDITIONING_MODULE_NAMES)
+    return list(modules_to_save)
+
+
+def configure_model_for_training_mode(model, mode: str, *, max_completion_length: int | None = None):
+    """Apply runtime toggles needed by a training mode before PEFT wrapping or adapter load."""
+    mode = _require_training_mode(mode)
+    if mode == "grpo":
+        if hasattr(model, "answer_start"):
+            delattr(model, "answer_start")
+    else:
+        model.answer_start = ANSWER_START
+
+    from time_conditioning import (
+        enable_time_conditioning,
+        get_time_conditioning_base_model,
+        set_thinking_residual_disabled,
+    )
+
+    inner = get_time_conditioning_base_model(model)
+    if max_completion_length is not None:
+        max_completion_length = int(max_completion_length)
+        if max_completion_length <= 0:
+            raise ValueError(f"max_completion_length must be positive, got {max_completion_length}")
+        inner.config.max_completion_length = max_completion_length
+
+    if mode_uses_thinking_residual(mode):
+        set_thinking_residual_disabled(model, False)
+    elif mode_uses_time_conditioning(mode):
+        set_thinking_residual_disabled(model, True)
+
+    if mode_uses_time_conditioning(mode):
+        enable_time_conditioning(model)
+    return model
+
+
+def reset_residual_lambda_for_mode(model, mode: str, residual_r_min: float, residual_r_max: float) -> None:
+    """Reset the thinking-residual radius only for modes that train that path."""
+    mode = _require_training_mode(mode)
+    if mode_uses_thinking_residual(mode):
+        model.model.model.thinking_residual_Lambda.reset_lambda_parameters(
+            r_min=residual_r_min,
+            r_max=residual_r_max,
+        )
+
+
+def load_training_model_and_tokenizer(args, mode: str):
+    from unsloth import FastLanguageModel
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=args.model_name,
+        max_seq_length=args.max_prompt_length + args.max_completion_length,
+        load_in_4bit=False,
+        load_in_8bit=False,
+        fast_inference=False,
+    )
+    configure_model_for_training_mode(model, mode, max_completion_length=args.max_completion_length)
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+    return model, tokenizer
+
+
+def prepare_training_model(model, args, mode: str):
+    from unsloth import FastLanguageModel
+
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=args.lora_rank,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        modules_to_save=get_modules_to_save_for_mode(mode),
+        lora_alpha=args.lora_rank * 2,
+        use_gradient_checkpointing="unsloth",
+        random_state=args.seed,
+    )
+    reset_residual_lambda_for_mode(
+        model,
+        mode,
+        residual_r_min=args.residual_r_min,
+        residual_r_max=args.residual_r_max,
+    )
+    return model
+
+
+def build_training_config(args, output_dir: str):
+    from trl import GRPOConfig
+    from unsloth import is_bfloat16_supported
+
+    save_steps = 250
+    if args.max_steps is not None and args.max_steps > 0:
+        save_steps = min(save_steps, int(args.max_steps))
+
+    return GRPOConfig(
+        use_vllm=False,
+        learning_rate=args.lr,
+        beta=args.beta,
+        adam_beta1=0.9,
+        adam_beta2=0.99,
+        weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
+        optim=args.optimizer,
+        max_grad_norm=args.max_grad_norm,
+        logging_steps=1,
+        bf16=is_bfloat16_supported(),
+        fp16=not is_bfloat16_supported(),
+        temperature=args.temperature,
+        num_generations=args.group_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        max_prompt_length=args.max_prompt_length,
+        max_completion_length=args.max_completion_length,
+        num_train_epochs=1,
+        max_steps=args.max_steps,
+        save_steps=save_steps,
+        save_total_limit=3,
+        report_to="none" if is_wandb_disabled() else "wandb",
+        output_dir=output_dir,
+    )
+
+
+def configure_trainer_for_mode(trainer, args, mode: str):
+    use_time_conditioning = mode_uses_time_conditioning(mode)
+    use_thinking_residual = mode_uses_thinking_residual(mode)
+    if use_time_conditioning:
+        trainer.thinking_time_loss_weight = args.thinking_time_loss_weight
+    if mode != "grpo":
+        from patch import patch_trainer_optimizer
+
+        patch_trainer_optimizer(
+            trainer,
+            lr_thinking_residual_gate=args.lr_residual_gate if use_thinking_residual else None,
+            thinking_residual_Lambda=args.lr_residual_Lambda if use_thinking_residual else None,
+            lr_time_conditioning=args.lr_time_conditioning if use_time_conditioning else None,
+        )
+    return trainer
+
+
+def create_training_trainer(args, task: str, dataset, reward_funcs):
+    from trl import GRPOTrainer
+
+    mode = _require_training_mode(args.mode)
+    exp_name = build_training_exp_name(
+        model_name=args.model_name,
+        task=task,
+        mode=mode,
+        group_size=args.group_size,
+        lora_rank=args.lora_rank,
+        temperature=args.temperature,
+        residual_r_min=args.residual_r_min,
+        exp_suffix=args.exp_suffix,
+    )
+    resume_from_checkpoint = resolve_resume_from_checkpoint(exp_name, resume=args.resume)
+    model, tokenizer = load_training_model_and_tokenizer(args, mode)
+    model = prepare_training_model(model, args, mode)
+    attach_adapter_metadata(model, build_adapter_metadata(args, task, mode))
+    print(
+        f"[train-config] task={task} mode={mode} "
+        f"dataset_size={len(dataset)} max_steps={args.max_steps} "
+        f"output_dir={exp_name}"
+    )
+    trainer = GRPOTrainer(
+        model=model,
+        processing_class=tokenizer,
+        reward_funcs=reward_funcs,
+        args=build_training_config(args, exp_name),
+        train_dataset=dataset,
+    )
+    configure_trainer_for_mode(trainer, args, mode)
+    return trainer, resume_from_checkpoint, mode, exp_name
+
+
+def create_training_parser(
+    *,
+    group_size: int,
+    per_device_train_batch_size: int,
+    max_prompt_length: int,
+    max_completion_length: int,
+    dataset_root_default: str | None = None,
+):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--lora_rank", type=int, default=32)
+
+    parser.add_argument("--lr", type=float, default=5e-6)
+    parser.add_argument("--beta", type=float, default=0.005)
+    parser.add_argument("--residual_r_min", type=float, default=0.99)
+    parser.add_argument("--residual_r_max", type=float, default=0.999)
+    parser.add_argument("--lr_residual_gate", type=float, default=1e-4)
+    parser.add_argument("--lr_residual_Lambda", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine")
+    parser.add_argument("--optimizer", type=str, default="paged_adamw_8bit")
+    parser.add_argument("--max_grad_norm", type=float, default=0.1)
+
+    parser.add_argument("--group_size", type=int, default=group_size)
+    parser.add_argument("--temperature", type=float, default=0.5)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument(
+        "--per_device_train_batch_size",
+        type=int,
+        default=per_device_train_batch_size,
+    )
+    parser.add_argument("--max_steps", type=int, default=-1)
+    parser.add_argument("--max_train_samples", type=int, default=None)
+    parser.add_argument("--max_prompt_length", type=int, default=max_prompt_length)
+    parser.add_argument("--max_completion_length", type=int, default=max_completion_length)
+
+    if dataset_root_default is not None:
+        parser.add_argument("--dataset_root", type=str, default=dataset_root_default)
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--mode", choices=sorted(TRAINING_MODES), required=True)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--thinking_time_loss_weight", type=float, default=0.1)
+    parser.add_argument("--lr_time_conditioning", type=float, default=1e-4)
+    parser.add_argument("--exp-suffix", "--exp_suffix", dest="exp_suffix", type=str, default="")
+    parser.add_argument("--resume", action="store_true", default=False)
+    return parser
+
+
+def limit_dataset_samples(dataset, max_train_samples: int | None):
+    if max_train_samples is None:
+        return dataset
+
+    max_train_samples = int(max_train_samples)
+    if max_train_samples <= 0:
+        raise ValueError(f"max_train_samples must be positive, got {max_train_samples}")
+
+    return dataset.select(range(min(len(dataset), max_train_samples)))
+
+
+def load_eval_model_and_tokenizer(
+    adapter_path: str,
+    *,
+    max_seq_length: int,
+):
+    from unsloth import FastLanguageModel
+    metadata = load_adapter_metadata(adapter_path)
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=metadata["base_model"],
+        max_seq_length=max_seq_length,
+        load_in_4bit=False,
+        fast_inference=False,
+    )
+    configure_model_for_training_mode(
+        model,
+        metadata["mode"],
+        max_completion_length=metadata.get("max_completion_length"),
+    )
+    tokenizer.padding_side = "left"
+    tokenizer.pad_token = tokenizer.eos_token
+    model.load_adapter(adapter_path)
+    model = FastLanguageModel.for_inference(model)
+    return model, tokenizer, metadata
+
+
+def build_generation_config(**kwargs):
+    # Import Unsloth first so eval scripts do not trigger its transformers-order warning.
+    import unsloth  # noqa: F401
+    from transformers import GenerationConfig
+
+    return GenerationConfig(**kwargs)
+
+
 def create_eval_parser():
-    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-greedy", dest="greedy", action="store_false", default=True)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--checkpoint_path", type=str, default=None)
-    parser.add_argument("--only_grpo", action="store_true", default=False)
-    parser.add_argument("--tgrpo", action="store_true", default=False)
     return parser
 
 SYSTEM_PROMPT = (
@@ -286,7 +701,6 @@ def _strip_string(string):
     string = string.replace("\\$", "")
     string = _remove_right_units(string)
     string = string.replace("\\%", "")
-    string = string.replace("\%", "")
     string = string.replace(" .", " 0.")
     string = string.replace("{.", "{0.")
 

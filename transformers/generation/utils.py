@@ -3283,12 +3283,9 @@ class GenerationMixin:
                 os.environ["TOKENIZERS_PARALLELISM"] = "0"
                 model_forward = self.get_compiled_call(generation_config.compile_config)
 
-        from time_conditioning import get_time_conditioning_base_model, reset_time_conditioning_state
+        from time_conditioning import get_time_conditioning_base_model, has_time_conditioning, reset_time_conditioning_state
         _tc_base = get_time_conditioning_base_model(self)
-        _tc_enabled = bool(
-            getattr(_tc_base, "use_time_conditioning", False)
-            and hasattr(_tc_base, "time_progress_predictor")
-        )
+        _tc_enabled = has_time_conditioning(_tc_base)
 
         if _tc_enabled:
             reset_time_conditioning_state(_tc_base)
@@ -3302,7 +3299,7 @@ class GenerationMixin:
         embeds_ratio = [
             torch.ones_like(input_ids, dtype=torch.float32, device=input_ids.device)
         ] if return_thinking_embeds else []
-        time_preds = [
+        thinking_time_preds = [
             torch.zeros(input_ids.shape[0], input_ids.shape[1], dtype=torch.float32, device=input_ids.device)
         ] if (return_thinking_embeds and _tc_enabled) else []
 
@@ -3395,9 +3392,11 @@ class GenerationMixin:
                     torch.tensor(outputs.hidden_states[2], device=input_ids.device).unsqueeze(1)
                 )
                 if _tc_enabled and len(outputs.hidden_states) > 3 and outputs.hidden_states[3] is not None:
-                    time_preds.append(outputs.hidden_states[3])
+                    thinking_time_preds.append(outputs.hidden_states[3])
                 elif _tc_enabled:
-                    time_preds.append(torch.zeros(input_ids.shape[0], 1, dtype=torch.float32, device=input_ids.device))
+                    thinking_time_preds.append(
+                        torch.zeros(input_ids.shape[0], 1, dtype=torch.float32, device=input_ids.device)
+                    )
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
             this_peer_finished = unfinished_sequences.max() == 0
@@ -3444,13 +3443,13 @@ class GenerationMixin:
                 if _tc_enabled:
                     # Carry the last available rollout prediction forward to the
                     # final generated token instead of fabricating a trailing zero.
-                    time_preds.append(time_preds[-1][:, -1:].clone())
+                    thinking_time_preds.append(thinking_time_preds[-1][:, -1:].clone())
                     return (
                         input_ids,
                         torch.cat(thinking_embeds, dim=1),
                         torch.cat(thinking_mask, dim=1),
                         torch.cat(embeds_ratio, dim=1),
-                        torch.cat(time_preds, dim=1),
+                        torch.cat(thinking_time_preds, dim=1),
                     )
                 return (
                     input_ids,
