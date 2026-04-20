@@ -27,6 +27,12 @@
 #   --thinking-time-loss-weight V
 #                         Thinking-time auxiliary loss weight (default: 0.1)
 #   --lr-time-cond V      Learning rate for time conditioning modules (default: 1e-4)
+#   --predictor-hidden-states N
+#                         Number of final output hidden states concatenated for
+#                         the time-conditioning predictor (default: 4)
+#   --time-predictor-warmup-fraction V
+#                         Fraction of the training dataset used for one-pass
+#                         predictor warmup before RL (default: 0.2)
 #   --exp-suffix NAME     Append a suffix to experiment dir names to avoid
 #                         checkpoint collisions with previous runs
 #   --max-steps N         Override trainer max_steps for smoke tests or short runs
@@ -80,7 +86,9 @@ DRY_RUN=false
 RESUME=false
 MODE="hrpo"
 THINKING_TIME_LOSS_WEIGHT=0.1
-LR_TIME_CONDITIONING=1e-4
+LR_TIME_CONDITIONING=5e-6
+THINKING_TIME_PREDICTOR_NUM_HIDDEN_STATES=2
+TIME_PREDICTOR_WARMUP_FRACTION=0.2
 EXP_SUFFIX=""
 MAX_STEPS=-1
 MAX_TRAIN_SAMPLES=""
@@ -114,6 +122,8 @@ while [[ $# -gt 0 ]]; do
         --dry-run)    DRY_RUN=true; shift ;;
         --thinking-time-loss-weight) THINKING_TIME_LOSS_WEIGHT="$2"; shift 2 ;;
         --lr-time-cond)     LR_TIME_CONDITIONING="$2"; shift 2 ;;
+        --predictor-hidden-states) THINKING_TIME_PREDICTOR_NUM_HIDDEN_STATES="$2"; shift 2 ;;
+        --time-predictor-warmup-fraction) TIME_PREDICTOR_WARMUP_FRACTION="$2"; shift 2 ;;
         --exp-suffix)       EXP_SUFFIX="$2"; shift 2 ;;
         --max-steps)        MAX_STEPS="$2"; shift 2 ;;
         --max-train-samples) MAX_TRAIN_SAMPLES="$2"; shift 2 ;;
@@ -225,7 +235,7 @@ common_train_args() {
         --seed ${SEED} \
         $( [ "${MAX_STEPS}" -gt 0 ] && echo "--max_steps ${MAX_STEPS}" ) \
         $( [ -n "${MAX_TRAIN_SAMPLES}" ] && echo "--max_train_samples ${MAX_TRAIN_SAMPLES}" ) \
-        $( [ "$MODE" = "thrpo" ] && echo "--thinking_time_loss_weight ${THINKING_TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING}" )"
+        $( [ "$MODE" = "thrpo" ] && echo "--thinking_time_loss_weight ${THINKING_TIME_LOSS_WEIGHT} --lr_time_conditioning ${LR_TIME_CONDITIONING} --thinking_time_predictor_num_hidden_states ${THINKING_TIME_PREDICTOR_NUM_HIDDEN_STATES} --time_predictor_warmup_fraction ${TIME_PREDICTOR_WARMUP_FRACTION}" )"
 }
 
 # ========================= Conda Activation ==================================

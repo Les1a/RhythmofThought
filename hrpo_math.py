@@ -11,6 +11,7 @@ from utils import (
     limit_dataset_samples,
     process_math,
     reward_func_math,
+    run_training_with_optional_time_predictor_warmup,
 )
 
 os.environ["WANDB_PROJECT"] = "latent-reasoning"
@@ -46,13 +47,19 @@ def main(args):
         root=args.dataset_root,
         max_train_samples=args.max_train_samples,
     )
-    trainer, resume_from_checkpoint, _, _ = create_training_trainer(
+    trainer, resume_from_checkpoint, mode, _ = create_training_trainer(
         args,
         task="math",
         dataset=dataset,
         reward_funcs=[reward_func_math],
     )
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    run_training_with_optional_time_predictor_warmup(
+        trainer,
+        args=args,
+        task="math",
+        mode=mode,
+        resume_from_checkpoint=resume_from_checkpoint,
+    )
 
 
 if __name__ == "__main__":

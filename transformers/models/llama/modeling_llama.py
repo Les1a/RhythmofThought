@@ -56,6 +56,8 @@ try:
         AdaLNProjection,
         ReasoningTimeEmbedding,
         ThinkingTimePredictor,
+        get_time_conditioning_predictor_num_hidden_states,
+        get_time_conditioning_predictor_input_size,
         prepare_adaln_modulation,
     )
     _HAS_TIME_CONDITIONING = True
@@ -586,7 +588,12 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if _HAS_TIME_CONDITIONING and getattr(config, 'use_time_conditioning', False):
             _te_dim = getattr(config, 'thinking_time_embed_dim', 256)
-            self.thinking_time_predictor = ThinkingTimePredictor(config.hidden_size)
+            self.thinking_time_predictor = ThinkingTimePredictor(
+                get_time_conditioning_predictor_input_size(
+                    config.hidden_size,
+                    get_time_conditioning_predictor_num_hidden_states(config),
+                )
+            )
             self.reasoning_time_embedding = ReasoningTimeEmbedding(
                 thinking_time_embed_dim=_te_dim,
                 num_frequencies=getattr(config, "thinking_time_num_frequencies", 32),
@@ -690,6 +697,12 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
+        _tc_enabled = has_time_conditioning(self)
+        _tc_num_hidden_states = (
+            get_time_conditioning_predictor_num_hidden_states(self.config) if _tc_enabled else None
+        )
+        _time_conditioning_hidden_history = [] if _tc_enabled else None
+
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -724,20 +737,42 @@ class LlamaModel(LlamaPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
+            if _time_conditioning_hidden_history is not None:
+                from time_conditioning import append_time_conditioning_hidden_state
+
+                append_time_conditioning_hidden_state(
+                    _time_conditioning_hidden_history,
+                    hidden_states.detach(),
+                    num_hidden_states=_tc_num_hidden_states,
+                )
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
-        if has_time_conditioning(self):
+        if _time_conditioning_hidden_history is not None:
+            from time_conditioning import append_time_conditioning_hidden_state
+
+            append_time_conditioning_hidden_state(
+                _time_conditioning_hidden_history,
+                hidden_states.detach(),
+                num_hidden_states=_tc_num_hidden_states,
+            )
+        if _tc_enabled:
+            from time_conditioning import concat_time_conditioning_hidden_states
+
+            predictor_hidden = concat_time_conditioning_hidden_states(
+                _time_conditioning_hidden_history,
+                num_hidden_states=_tc_num_hidden_states,
+            )
             _predict_mask = getattr(self, '_train_thinking_time_mask', None)
             if _predict_mask is None:
                 # Rollout/inference: cache hidden state for next decode step (only thinking positions)
                 from time_conditioning import update_online_thinking_time_hidden_cache
-                _new_hidden = hidden_states[:, -1:, :].detach()
+                _new_hidden = predictor_hidden[:, -1:, :]
                 update_online_thinking_time_hidden_cache(self, _new_hidden, _is_thinking)
             else:
-                self._train_predictor_hidden_states = hidden_states.detach()
+                self._train_predictor_hidden_states = predictor_hidden
 
         # add hidden states from the last decoder layer
         if output_hidden_states:

@@ -11,11 +11,107 @@ TIME_CONDITIONING_MODULE_NAMES = (
     "thinking_time_predictor",
     "reasoning_time_embedding",
 )
+DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES = 4
 THINKING_RESIDUAL_MODULE_NAMES = (
     "thinking_residual_gate_r",
     "thinking_residual_gate_i",
     "thinking_residual_Lambda",
 )
+
+
+def get_time_conditioning_predictor_num_hidden_states(config_or_model):
+    """Return how many recent output hidden states to concatenate for the predictor."""
+    if hasattr(config_or_model, "config"):
+        config_or_model = config_or_model.config
+    raw_value = getattr(
+        config_or_model,
+        "thinking_time_predictor_num_hidden_states",
+        DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES,
+    )
+    try:
+        num_hidden_states = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "thinking_time_predictor_num_hidden_states must be an integer, "
+            f"got {raw_value!r}"
+        ) from exc
+    if num_hidden_states <= 0:
+        raise ValueError(
+            "thinking_time_predictor_num_hidden_states must be positive, "
+            f"got {num_hidden_states}"
+        )
+    return num_hidden_states
+
+
+def _coerce_time_conditioning_predictor_num_hidden_states(num_hidden_states):
+    return get_time_conditioning_predictor_num_hidden_states(
+        type("_PredictorConfig", (), {"thinking_time_predictor_num_hidden_states": num_hidden_states})()
+    )
+
+
+def get_time_conditioning_predictor_input_size(hidden_size, num_hidden_states=None):
+    """Return predictor input width after concatenating the last hidden-state outputs."""
+    hidden_size = int(hidden_size)
+    if hidden_size <= 0:
+        raise ValueError(f"hidden_size must be positive, got {hidden_size}")
+    if num_hidden_states is None:
+        num_hidden_states = DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES
+    else:
+        num_hidden_states = _coerce_time_conditioning_predictor_num_hidden_states(num_hidden_states)
+    return num_hidden_states * hidden_size
+
+
+def append_time_conditioning_hidden_state(hidden_history, hidden_state, num_hidden_states=None):
+    """Append one hidden-state tensor while bounding history to the most recent N outputs."""
+    if hidden_history is None:
+        raise ValueError("hidden_history must be provided")
+    if not torch.is_tensor(hidden_state):
+        raise ValueError("hidden_state must be a tensor")
+
+    if num_hidden_states is None:
+        num_hidden_states = DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES
+    else:
+        num_hidden_states = _coerce_time_conditioning_predictor_num_hidden_states(num_hidden_states)
+
+    hidden_history.append(hidden_state)
+    overflow = len(hidden_history) - num_hidden_states
+    if overflow > 0:
+        del hidden_history[:overflow]
+    return hidden_history
+
+
+def concat_time_conditioning_hidden_states(hidden_states, num_hidden_states=None):
+    """Concatenate the most recent output hidden states along the hidden dimension."""
+    hidden_states = list(hidden_states)
+    if num_hidden_states is None:
+        num_hidden_states = DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES
+    else:
+        num_hidden_states = _coerce_time_conditioning_predictor_num_hidden_states(num_hidden_states)
+    if len(hidden_states) < num_hidden_states:
+        raise ValueError(
+            "expected at least "
+            f"{num_hidden_states} hidden-state outputs, got {len(hidden_states)}"
+        )
+
+    selected_hidden_states = hidden_states[-num_hidden_states:]
+    ref_shape = None
+    for idx, hidden_state in enumerate(selected_hidden_states):
+        if not torch.is_tensor(hidden_state):
+            raise ValueError(f"hidden state at index {idx} is not a tensor")
+        if hidden_state.ndim != 3:
+            raise ValueError(
+                "hidden states must be rank-3 (B, L, H), "
+                f"got shape {tuple(hidden_state.shape)} at index {idx}"
+            )
+        if ref_shape is None:
+            ref_shape = hidden_state.shape[:2]
+        elif hidden_state.shape[:2] != ref_shape:
+            raise ValueError(
+                "hidden states must share leading dims before concatenation: "
+                f"{tuple(hidden_state.shape[:2])} vs {tuple(ref_shape)}"
+            )
+
+    return torch.cat(selected_hidden_states, dim=-1)
 
 
 class ThinkingTimePredictor(nn.Module):
@@ -256,9 +352,12 @@ def summarize_residual_rollout_metrics(embeds_ratio):
 TRAINING_REPLAY_NOISE_EPS = 0.01
 
 
-def _sample_training_replay_noisy_gt(gt_thinking_time):
-    noise = torch.empty_like(gt_thinking_time).uniform_(-TRAINING_REPLAY_NOISE_EPS, TRAINING_REPLAY_NOISE_EPS)
-    return (gt_thinking_time + noise).clamp(0.0, 1.0)
+def _sample_training_replay_noisy_prediction(predicted_thinking_time):
+    noise = torch.empty_like(predicted_thinking_time).uniform_(
+        -TRAINING_REPLAY_NOISE_EPS,
+        TRAINING_REPLAY_NOISE_EPS,
+    )
+    return (predicted_thinking_time + noise).clamp(0.0, 1.0)
 
 
 def select_training_thinking_time_embedding(
@@ -267,7 +366,7 @@ def select_training_thinking_time_embedding(
     rollout_thinking_time=None,
     thinking_mask=None,
 ):
-    """Build the training-time replay signal from GT thinking time plus fixed noise."""
+    """Build the training-time replay signal from rollout self-predicted time plus fixed noise."""
     if gt_thinking_time.ndim != 2:
         raise ValueError(
             f"gt_thinking_time must be rank-2 (B, L), got shape {tuple(gt_thinking_time.shape)}"
@@ -279,36 +378,33 @@ def select_training_thinking_time_embedding(
         thinking_mask = gt_thinking_time > 0
     thinking_mask = _normalize_sequence_mask(thinking_mask, gt_thinking_time.shape, gt_thinking_time.device)
 
-    rollout_available = rollout_thinking_time is not None
-    if rollout_available:
-        if rollout_thinking_time.shape != gt_thinking_time.shape:
-            raise ValueError(
-                "rollout_thinking_time shape does not match gt_thinking_time: "
-                f"{tuple(rollout_thinking_time.shape)} vs {tuple(gt_thinking_time.shape)}"
-            )
-        rollout_thinking_time = rollout_thinking_time.to(
-            device=gt_thinking_time.device,
-            dtype=gt_thinking_time.dtype,
-        ).detach()
-        if not torch.isfinite(rollout_thinking_time).all():
-            raise ValueError("rollout_thinking_time contains non-finite values")
-        rollout_thinking_time = rollout_thinking_time.clamp(0.0, 1.0)
+    if rollout_thinking_time is None:
+        raise ValueError("rollout_thinking_time must be provided for replay training")
+    if rollout_thinking_time.shape != gt_thinking_time.shape:
+        raise ValueError(
+            "rollout_thinking_time shape does not match gt_thinking_time: "
+            f"{tuple(rollout_thinking_time.shape)} vs {tuple(gt_thinking_time.shape)}"
+        )
+    rollout_thinking_time = rollout_thinking_time.to(
+        device=gt_thinking_time.device,
+        dtype=gt_thinking_time.dtype,
+    ).detach()
+    if not torch.isfinite(rollout_thinking_time).all():
+        raise ValueError("rollout_thinking_time contains non-finite values")
+    rollout_thinking_time = rollout_thinking_time.clamp(0.0, 1.0)
 
     config = getattr(base_model, "config", None)
     try:
         rollout_margin = max(float(getattr(config, "thinking_time_rollout_trust_margin", 0.05)), 0.0)
     except (TypeError, ValueError):
         rollout_margin = 0.05
-    noisy_gt_thinking_time = _sample_training_replay_noisy_gt(gt_thinking_time)
+    noisy_rollout_thinking_time = _sample_training_replay_noisy_prediction(rollout_thinking_time)
     mask_float = thinking_mask.float()
-    if rollout_available:
-        rollout_error = (
-            dead_zone_mse(rollout_thinking_time, gt_thinking_time, margin=rollout_margin) * mask_float
-        ).sum(1) / mask_float.sum(1).clamp(min=1)
-    else:
-        rollout_error = torch.zeros(gt_thinking_time.shape[0], device=gt_thinking_time.device, dtype=gt_thinking_time.dtype)
+    rollout_error = (
+        dead_zone_mse(rollout_thinking_time, gt_thinking_time, margin=rollout_margin) * mask_float
+    ).sum(1) / mask_float.sum(1).clamp(min=1)
 
-    selected_thinking_time = noisy_gt_thinking_time
+    selected_thinking_time = noisy_rollout_thinking_time
     selected_thinking_time = torch.where(
         thinking_mask,
         selected_thinking_time,
@@ -473,6 +569,77 @@ def build_replay_lagged_predictor_trace(
     return lagged_hidden, lagged_mask
 
 
+def predict_replay_thinking_time_from_hidden_trace(
+    predictor,
+    replay_hidden,
+    *,
+    prompt_mask,
+    thinking_mask,
+):
+    """Predict replay thinking time without materializing the full lagged hidden trace."""
+    if replay_hidden is None:
+        raise ValueError("replay_hidden must be provided for replay prediction")
+    if replay_hidden.ndim != 3:
+        raise ValueError(
+            "replay_hidden must be rank-3 (B, L, H), "
+            f"got shape {tuple(replay_hidden.shape)}"
+        )
+
+    batch_size, seq_len, _ = replay_hidden.shape
+    lagged_mask = _normalize_sequence_mask(
+        thinking_mask,
+        (batch_size, seq_len),
+        replay_hidden.device,
+    )
+
+    if prompt_mask is None:
+        raise ValueError("prompt_mask must be provided for replay prediction")
+    if not torch.is_tensor(prompt_mask):
+        prompt_mask = torch.tensor(prompt_mask, device=replay_hidden.device)
+    prompt_mask = prompt_mask.to(device=replay_hidden.device, dtype=torch.bool)
+    if prompt_mask.ndim != 2 or prompt_mask.shape[0] != batch_size:
+        raise ValueError(
+            "prompt_mask must have shape (B, P), "
+            f"got shape {tuple(prompt_mask.shape)} for batch size {batch_size}"
+        )
+
+    prompt_lengths = prompt_mask.long().sum(dim=1)
+    if (prompt_lengths <= 0).any():
+        raise ValueError("prompt_mask must include at least one prompt token per sample")
+    if (prompt_lengths > seq_len).any():
+        raise ValueError(
+            "prompt_mask describes more prompt tokens than replay_hidden sequence length: "
+            f"{prompt_lengths.tolist()} vs seq_len={seq_len}"
+        )
+
+    batch_indices = torch.arange(batch_size, device=replay_hidden.device)
+    carry = replay_hidden[batch_indices, prompt_lengths - 1].unsqueeze(1)
+    preds = []
+    zero_step = torch.zeros(batch_size, 1, device=replay_hidden.device, dtype=replay_hidden.dtype)
+
+    for pos_idx in range(seq_len):
+        after_prompt_mask = (prompt_lengths <= pos_idx).unsqueeze(1)
+        step_mask = lagged_mask[:, pos_idx : pos_idx + 1] & after_prompt_mask
+        if step_mask.any():
+            step_pred = _predict_thinking_time_from_hidden_trace(
+                predictor,
+                carry,
+                step_mask,
+            )
+        else:
+            step_pred = zero_step
+        preds.append(step_pred)
+
+        current_hidden = replay_hidden[:, pos_idx : pos_idx + 1, :]
+        carry = torch.where(
+            lagged_mask[:, pos_idx : pos_idx + 1].unsqueeze(-1),
+            current_hidden,
+            carry,
+        )
+
+    return torch.cat(preds, dim=1).clamp(0.0, 1.0), lagged_mask
+
+
 def _predict_thinking_time_from_hidden_trace(
     predictor,
     predictor_hidden_input,
@@ -514,18 +681,12 @@ def compute_thinking_time_aux_loss(
             f"{tuple(replay_hidden.shape[:2])} vs {tuple(gt_thinking_time.shape)}"
         )
 
-    lagged_hidden, lagged_mask = build_replay_lagged_predictor_trace(
+    thinking_time_pred, lagged_mask = predict_replay_thinking_time_from_hidden_trace(
+        base_model.thinking_time_predictor,
         replay_hidden,
         prompt_mask=prompt_mask,
         thinking_mask=thinking_mask,
     )
-
-    with torch.inference_mode(False):
-        thinking_time_pred = _predict_thinking_time_from_hidden_trace(
-            base_model.thinking_time_predictor,
-            lagged_hidden.clone(),
-            lagged_mask.clone(),
-        )
 
     mask_bool = lagged_mask.bool() & thinking_mask.bool()
     mask_float = mask_bool.float()
@@ -681,8 +842,13 @@ def enable_time_conditioning(model):
     thinking_time_gamma_cap = _read_non_negative_float("thinking_time_gamma_cap", 0.99)
     thinking_time_beta_cap = _read_non_negative_float("thinking_time_beta_cap", 0.99)
     thinking_time_alpha_cap = _read_non_negative_float("thinking_time_alpha_cap", 0.99)
+    thinking_time_predictor_num_hidden_states = get_time_conditioning_predictor_num_hidden_states(config)
     device = next(inner.parameters()).device
     dtype = next(inner.parameters()).dtype
+    predictor_input_size = get_time_conditioning_predictor_input_size(
+        config.hidden_size,
+        thinking_time_predictor_num_hidden_states,
+    )
 
     for layer in inner.layers:
         if not hasattr(layer, "adaln_proj"):
@@ -700,8 +866,14 @@ def enable_time_conditioning(model):
                 alpha_cap=thinking_time_alpha_cap,
             )
 
-    if not hasattr(inner, "thinking_time_predictor"):
-        inner.thinking_time_predictor = ThinkingTimePredictor(config.hidden_size).to(device=device, dtype=dtype)
+    predictor_input_features = None
+    if hasattr(inner, "thinking_time_predictor") and hasattr(inner.thinking_time_predictor, "net"):
+        first_layer = inner.thinking_time_predictor.net[0]
+        predictor_input_features = getattr(first_layer, "in_features", None)
+    if predictor_input_features != predictor_input_size:
+        inner.thinking_time_predictor = ThinkingTimePredictor(predictor_input_size).to(
+            device=device, dtype=dtype
+        )
     if not hasattr(inner, "reasoning_time_embedding"):
         inner.reasoning_time_embedding = ReasoningTimeEmbedding(
             thinking_time_embed_dim=thinking_time_embed_dim,
@@ -725,4 +897,5 @@ def enable_time_conditioning(model):
     config.thinking_time_gamma_cap = float(thinking_time_gamma_cap)
     config.thinking_time_beta_cap = float(thinking_time_beta_cap)
     config.thinking_time_alpha_cap = float(thinking_time_alpha_cap)
+    config.thinking_time_predictor_num_hidden_states = int(thinking_time_predictor_num_hidden_states)
     reset_time_conditioning_state(inner)

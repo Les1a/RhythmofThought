@@ -35,6 +35,10 @@ def test_run_script_dry_run_accepts_smoke_flags(script_name: str, mode: str, exp
             "1",
             "--max-train-samples",
             "8",
+            "--predictor-hidden-states",
+            "7",
+            "--time-predictor-warmup-fraction",
+            "0.4",
         ],
         cwd=REPO_ROOT,
         text=True,
@@ -50,3 +54,7 @@ def test_run_script_dry_run_accepts_smoke_flags(script_name: str, mode: str, exp
     if expects_time_conditioning:
         assert "--thinking_time_loss_weight" in result.stdout
         assert "--lr_time_conditioning" in result.stdout
+        assert "--thinking_time_predictor_num_hidden_states 7" in result.stdout
+        assert "--time_predictor_warmup_fraction 0.4" in result.stdout
+    else:
+        assert "--time_predictor_warmup_fraction" not in result.stdout

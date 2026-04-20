@@ -16,10 +16,12 @@ from utils import (
     ADAPTER_METADATA_KEY,
     attach_adapter_metadata,
     build_training_exp_name,
+    build_adapter_metadata,
     configure_model_for_training_mode,
     create_training_parser,
     get_modules_to_save_for_mode,
     load_adapter_metadata,
+    resolve_time_conditioning_predictor_num_hidden_states,
     resolve_resume_from_checkpoint,
 )
 
@@ -88,7 +90,12 @@ def test_configure_model_for_training_mode_enables_time_conditioning_only_for_tg
     thrpo = _DummyWrapper()
     grpo = _DummyWrapper()
 
-    configure_model_for_training_mode(tgrpo, "tgrpo", max_completion_length=77)
+    configure_model_for_training_mode(
+        tgrpo,
+        "tgrpo",
+        max_completion_length=77,
+        thinking_time_predictor_num_hidden_states=6,
+    )
     configure_model_for_training_mode(thrpo, "thrpo")
     configure_model_for_training_mode(grpo, "grpo")
 
@@ -96,6 +103,8 @@ def test_configure_model_for_training_mode_enables_time_conditioning_only_for_tg
     assert getattr(tgrpo, "disable_thinking_residual", False) is True
     assert getattr(tgrpo.model, "use_time_conditioning", False) is True
     assert tgrpo.model.config.max_completion_length == 77
+    assert tgrpo.model.config.thinking_time_predictor_num_hidden_states == 6
+    assert tgrpo.model.thinking_time_predictor.net[0].in_features == 48
     assert thrpo.answer_start == ANSWER_START
     assert getattr(thrpo, "disable_thinking_residual", False) is False
     assert getattr(thrpo.model, "use_time_conditioning", False) is True
@@ -152,6 +161,8 @@ def test_create_training_parser_preserves_common_cli_shape():
             "/tmp/data",
             "--mode",
             "tgrpo",
+            "--thinking_time_predictor_num_hidden_states",
+            "7",
             "--max_steps",
             "3",
             "--max_train_samples",
@@ -167,25 +178,115 @@ def test_create_training_parser_preserves_common_cli_shape():
     assert args.exp_suffix == "smoke"
     assert args.dataset_root == "/tmp/data"
     assert args.mode == "tgrpo"
+    assert args.thinking_time_predictor_num_hidden_states == 7
+    assert args._thinking_time_predictor_num_hidden_states_explicit is True
     assert args.max_steps == 3
     assert args.max_train_samples == 12
     assert args.resume is True
+
+
+def test_create_training_parser_accepts_time_predictor_warmup_fraction():
+    parser = create_training_parser(
+        group_size=4,
+        per_device_train_batch_size=8,
+        max_prompt_length=1024,
+        max_completion_length=1024,
+    )
+
+    args = parser.parse_args(
+        [
+            "--mode",
+            "tgrpo",
+            "--time-predictor-warmup-fraction",
+            "0.35",
+        ]
+    )
+
+    assert args.time_predictor_warmup_fraction == pytest.approx(0.35)
+
+
+def test_create_training_parser_defaults_time_predictor_warmup_fraction():
+    parser = create_training_parser(
+        group_size=4,
+        per_device_train_batch_size=8,
+        max_prompt_length=1024,
+        max_completion_length=1024,
+    )
+
+    args = parser.parse_args(["--mode", "thrpo"])
+
+    assert args.time_predictor_warmup_fraction == pytest.approx(0.2)
 
 
 def test_load_adapter_metadata_reads_standard_rot_metadata(tmp_path):
     adapter_dir = tmp_path / "adapter"
     adapter_dir.mkdir()
     metadata = {
-        "schema_version": 1,
+        "schema_version": 2,
         "task": "gsm8k",
         "mode": "thrpo",
         "base_model": "Qwen/Qwen2.5-3B-Instruct",
         "temperature": 0.7,
+        "thinking_time_predictor_num_hidden_states": 5,
     }
     (adapter_dir / "adapter_config.json").write_text(
-        '{"peft_type":"LORA","rot_metadata":{"schema_version":1,"task":"gsm8k","mode":"thrpo","base_model":"Qwen/Qwen2.5-3B-Instruct","temperature":0.7}}'
+        '{"peft_type":"LORA","rot_metadata":{"schema_version":2,"task":"gsm8k","mode":"thrpo","base_model":"Qwen/Qwen2.5-3B-Instruct","temperature":0.7,"thinking_time_predictor_num_hidden_states":5}}'
     )
 
     loaded = load_adapter_metadata(str(adapter_dir))
 
     assert loaded == metadata
+
+
+def test_build_adapter_metadata_includes_time_conditioning_hidden_state_count():
+    args = SimpleNamespace(
+        model_name="Qwen/Qwen2.5-3B-Instruct",
+        temperature=0.5,
+        group_size=4,
+        lora_rank=32,
+        max_prompt_length=1024,
+        max_completion_length=1024,
+        residual_r_min=0.99,
+        residual_r_max=0.999,
+        thinking_time_loss_weight=0.1,
+        lr=5e-6,
+        lr_residual_gate=1e-4,
+        lr_residual_Lambda=1e-3,
+        lr_time_conditioning=1e-4,
+        thinking_time_predictor_num_hidden_states=6,
+    )
+
+    metadata = build_adapter_metadata(args, task="gsm8k", mode="tgrpo")
+
+    assert metadata["thinking_time_predictor_num_hidden_states"] == 6
+
+
+def test_resolve_time_conditioning_predictor_num_hidden_states_uses_checkpoint_value_and_rejects_conflict(tmp_path):
+    checkpoint_dir = tmp_path / "checkpoint-10"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "adapter_config.json").write_text(
+        '{"peft_type":"LORA","rot_metadata":{"schema_version":2,"task":"gsm8k","mode":"tgrpo","base_model":"Qwen/Qwen2.5-3B-Instruct","temperature":0.5,"thinking_time_predictor_num_hidden_states":6}}'
+    )
+
+    implicit_args = SimpleNamespace(
+        thinking_time_predictor_num_hidden_states=4,
+        _thinking_time_predictor_num_hidden_states_explicit=False,
+    )
+    resolved = resolve_time_conditioning_predictor_num_hidden_states(
+        implicit_args,
+        mode="tgrpo",
+        checkpoint_path=str(checkpoint_dir),
+    )
+    assert resolved == 6
+    assert implicit_args.thinking_time_predictor_num_hidden_states == 6
+
+    explicit_args = SimpleNamespace(
+        thinking_time_predictor_num_hidden_states=5,
+        _thinking_time_predictor_num_hidden_states_explicit=True,
+    )
+    with pytest.raises(ValueError, match="thinking_time_predictor_num_hidden_states"):
+        resolve_time_conditioning_predictor_num_hidden_states(
+            explicit_args,
+            mode="tgrpo",
+            checkpoint_path=str(checkpoint_dir),
+        )

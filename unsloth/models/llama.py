@@ -787,7 +787,12 @@ def LlamaModel_fast_forward(
     _thinking_time_emb = None
     _thinking_time_mask = None
     from time_conditioning import has_time_conditioning
-    if has_time_conditioning(self):
+    _tc_enabled = has_time_conditioning(self)
+    _tc_num_hidden_states = None
+    if _tc_enabled:
+        from time_conditioning import get_time_conditioning_predictor_num_hidden_states
+
+        _tc_num_hidden_states = get_time_conditioning_predictor_num_hidden_states(self.config)
         _gt = getattr(self, '_train_thinking_time_emb', None)
         if _gt is not None:
             # GT mode (training): use pre-computed thinking-time embeddings
@@ -817,6 +822,7 @@ def LlamaModel_fast_forward(
 
     # decoder layers
     all_hidden_states = () if output_hidden_states else None
+    _time_conditioning_hidden_history = [] if _tc_enabled else None
     all_self_attns = () if output_attentions else None
     next_decoder_cache = () if use_cache else None
 
@@ -963,6 +969,15 @@ def LlamaModel_fast_forward(
             hidden_states = layer_outputs[0]
         pass
 
+        if _time_conditioning_hidden_history is not None:
+            from time_conditioning import append_time_conditioning_hidden_state
+
+            append_time_conditioning_hidden_state(
+                _time_conditioning_hidden_history,
+                hidden_states.detach(),
+                num_hidden_states=_tc_num_hidden_states,
+            )
+
         if use_cache: next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
         if output_attentions: all_self_attns += (layer_outputs[1],)
     pass
@@ -977,15 +992,31 @@ def LlamaModel_fast_forward(
     else:
         hidden_states = fast_rms_layernorm(self.norm, hidden_states, gemma = IS_GEMMA)
     pass
-    if has_time_conditioning(self):
+    if _time_conditioning_hidden_history is not None:
+        from time_conditioning import append_time_conditioning_hidden_state
+
+        append_time_conditioning_hidden_state(
+            _time_conditioning_hidden_history,
+            hidden_states.detach(),
+            num_hidden_states=_tc_num_hidden_states,
+        )
+    if _tc_enabled:
+        from time_conditioning import (
+            concat_time_conditioning_hidden_states,
+        )
+
+        _predictor_hidden = concat_time_conditioning_hidden_states(
+            _time_conditioning_hidden_history,
+            num_hidden_states=_tc_num_hidden_states,
+        )
         _predict_mask = getattr(self, '_train_thinking_time_mask', None)
         if _predict_mask is None:
             # Rollout/inference: cache hidden state for next decode step (only thinking positions)
             from time_conditioning import update_online_thinking_time_hidden_cache
-            _new_hidden = hidden_states[:, -1:, :].detach()
+            _new_hidden = _predictor_hidden[:, -1:, :]
             update_online_thinking_time_hidden_cache(self, _new_hidden, kwargs.get('is_thinking', None))
         else:
-            self._train_predictor_hidden_states = hidden_states.detach()
+            self._train_predictor_hidden_states = _predictor_hidden
 
     if output_hidden_states: all_hidden_states += (hidden_states,)
     next_cache = next_decoder_cache if use_cache else None
@@ -1024,7 +1055,12 @@ def LlamaModel_fast_forward_inference(
     # Short-circuit: skip TC entirely once all batch elements have stopped thinking
     _thinking_time_emb_inf = None
     is_thinking = kwargs.get('is_thinking')
-    if has_time_conditioning(self.model):
+    _tc_enabled = has_time_conditioning(self.model)
+    _tc_num_hidden_states = None
+    if _tc_enabled:
+        from time_conditioning import get_time_conditioning_predictor_num_hidden_states
+
+        _tc_num_hidden_states = get_time_conditioning_predictor_num_hidden_states(self.model.config)
         if is_thinking is None or any(is_thinking):
             from time_conditioning import prepare_online_thinking_time_conditioning
             _thinking_time_emb_inf, _, _ = prepare_online_thinking_time_conditioning(
@@ -1083,6 +1119,7 @@ def LlamaModel_fast_forward_inference(
     pass
 
     next_decoder_cache = []
+    _time_conditioning_hidden_history = [] if _tc_enabled else None
 
     for idx, decoder_layer in enumerate(self.model.layers):
         # Per-layer AdaLN for decode (gated by is_thinking)
@@ -1146,6 +1183,14 @@ def LlamaModel_fast_forward_inference(
         else:
             X += residual
 
+        if _time_conditioning_hidden_history is not None:
+            from time_conditioning import append_time_conditioning_hidden_state
+
+            append_time_conditioning_hidden_state(
+                _time_conditioning_hidden_history,
+                X.detach(),
+                num_hidden_states=_tc_num_hidden_states,
+            )
         next_decoder_cache.append(present_key_value)
     pass
     X = fast_rms_layernorm_inference(
@@ -1155,13 +1200,28 @@ def LlamaModel_fast_forward_inference(
         XX2 = XX2,
         variance = variance,
     )
-    if has_time_conditioning(self.model):
+    if _time_conditioning_hidden_history is not None:
+        from time_conditioning import append_time_conditioning_hidden_state
+
+        append_time_conditioning_hidden_state(
+            _time_conditioning_hidden_history,
+            X.detach(),
+            num_hidden_states=_tc_num_hidden_states,
+        )
+    if _tc_enabled:
+        from time_conditioning import (
+            concat_time_conditioning_hidden_states,
+        )
+
+        _predictor_hidden = concat_time_conditioning_hidden_states(
+            _time_conditioning_hidden_history,
+            num_hidden_states=_tc_num_hidden_states,
+        )
         if is_thinking is None or any(is_thinking):
             from time_conditioning import update_online_thinking_time_hidden_cache
-            _new_hidden = X[:, -1:, :].detach()
+            _new_hidden = _predictor_hidden[:, -1:, :]
             update_online_thinking_time_hidden_cache(self.model, _new_hidden, is_thinking)
 
-    _tc_enabled = has_time_conditioning(self.model)
     _used_thinking_time = getattr(
         self.model,
         '_used_thinking_time',

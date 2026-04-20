@@ -10,6 +10,7 @@ from utils import (
     limit_dataset_samples,
     process_gsm8k,
     reward_func_math,
+    run_training_with_optional_time_predictor_warmup,
 )
 
 os.environ["WANDB_PROJECT"] = "latent-reasoning"
@@ -24,13 +25,19 @@ def preprocess_gsm8k(split="train", chunk_size=1000, max_train_samples=None) -> 
 
 def main(args):
     dataset = preprocess_gsm8k('train', chunk_size=500, max_train_samples=args.max_train_samples)
-    trainer, resume_from_checkpoint, _, _ = create_training_trainer(
+    trainer, resume_from_checkpoint, mode, _ = create_training_trainer(
         args,
         task="gsm8k",
         dataset=dataset,
         reward_funcs=[reward_func_math],
     )
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    run_training_with_optional_time_predictor_warmup(
+        trainer,
+        args=args,
+        task="gsm8k",
+        mode=mode,
+        resume_from_checkpoint=resume_from_checkpoint,
+    )
 
 
 if __name__ == "__main__":

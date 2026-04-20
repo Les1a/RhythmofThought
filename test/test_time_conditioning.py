@@ -12,14 +12,20 @@ if str(REPO_ROOT) not in sys.path:
 
 from time_conditioning import (
     AdaLNProjection,
+    DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES,
     ReasoningTimeEmbedding,
     ThinkingTimePredictor,
+    append_time_conditioning_hidden_state,
     build_replay_lagged_predictor_trace,
+    concat_time_conditioning_hidden_states,
     compute_thinking_time_aux_loss,
     enable_time_conditioning,
+    get_time_conditioning_predictor_num_hidden_states,
+    get_time_conditioning_predictor_input_size,
     prepare_adaln_modulation,
     prepare_online_thinking_time_conditioning,
     prepare_trainer_time_conditioning,
+    predict_replay_thinking_time_from_hidden_trace,
     reset_time_conditioning_state,
     select_training_thinking_time_embedding,
     set_thinking_residual_disabled,
@@ -82,6 +88,23 @@ class _RecordingPredictor(nn.Module):
         return torch.where(mask, values, torch.zeros_like(values))
 
 
+class _EchoPredictor(nn.Module):
+    def forward(self, inputs_embeds, thinking_mask=None):
+        values = inputs_embeds[..., 0]
+        if thinking_mask is None:
+            return values
+        return torch.where(thinking_mask, values, torch.zeros_like(values))
+
+    def forward_step(self, inputs_embeds, is_thinking=None):
+        values = inputs_embeds[..., 0]
+        if is_thinking is None:
+            return values
+        mask = torch.as_tensor(is_thinking, device=inputs_embeds.device, dtype=torch.bool)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(1)
+        return torch.where(mask, values, torch.zeros_like(values))
+
+
 def test_predictor_masks_finished_rows():
     predictor = ThinkingTimePredictor(hidden_size=4)
     with torch.no_grad():
@@ -98,12 +121,76 @@ def test_predictor_masks_finished_rows():
     assert used_thinking_time[1, 0] == 0.0
 
 
+def test_enable_time_conditioning_defaults_predictor_hidden_state_count_to_four():
+    wrapper = _DummyWrapper()
+    enable_time_conditioning(wrapper)
+
+    base = wrapper.model
+    predictor = base.thinking_time_predictor
+
+    assert get_time_conditioning_predictor_num_hidden_states(base.config) == (
+        DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES
+    )
+    assert predictor.net[0].in_features == get_time_conditioning_predictor_input_size(
+        base.config.hidden_size,
+        DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES,
+    )
+    assert predictor.net[0].in_features == (
+        DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES * base.config.hidden_size
+    )
+
+
+def test_enable_time_conditioning_uses_configured_predictor_hidden_state_count():
+    wrapper = _DummyWrapper()
+    wrapper.model.config.thinking_time_predictor_num_hidden_states = 3
+
+    enable_time_conditioning(wrapper)
+
+    base = wrapper.model
+    predictor = base.thinking_time_predictor
+
+    assert get_time_conditioning_predictor_num_hidden_states(base.config) == 3
+    assert predictor.net[0].in_features == get_time_conditioning_predictor_input_size(
+        base.config.hidden_size,
+        3,
+    )
+    assert predictor.net[0].in_features == 3 * base.config.hidden_size
+
+
+def test_concat_time_conditioning_hidden_states_uses_configured_last_n_outputs():
+    hidden_trace = [torch.full((1, 2, 1), float(idx)) for idx in range(6)]
+
+    combined = concat_time_conditioning_hidden_states(hidden_trace, num_hidden_states=3)
+
+    assert combined.shape == (1, 2, 3)
+    expected = torch.tensor([[[3.0, 4.0, 5.0], [3.0, 4.0, 5.0]]])
+    assert torch.equal(combined, expected)
+
+
+def test_append_time_conditioning_hidden_state_trims_history_to_last_n_outputs():
+    hidden_history = []
+
+    for idx in range(6):
+        append_time_conditioning_hidden_state(
+            hidden_history,
+            torch.full((1, 1, 1), float(idx)),
+            num_hidden_states=3,
+        )
+
+    assert len(hidden_history) == 3
+    assert [tensor.item() for tensor in hidden_history] == [3.0, 4.0, 5.0]
+
+
 def test_online_conditioning_uses_cached_hidden_and_freezes_finished_rows():
     wrapper = _DummyWrapper()
     enable_time_conditioning(wrapper)
     base = wrapper.model
-    old_hidden = torch.randn(2, 1, base.config.hidden_size)
-    new_hidden = torch.randn(2, 1, base.config.hidden_size)
+    predictor_hidden_size = get_time_conditioning_predictor_input_size(
+        base.config.hidden_size,
+        get_time_conditioning_predictor_num_hidden_states(base.config),
+    )
+    old_hidden = torch.randn(2, 1, predictor_hidden_size)
+    new_hidden = torch.randn(2, 1, predictor_hidden_size)
     base._cached_last_hidden = old_hidden.clone()
     base.thinking_time_predictor = _RecordingPredictor(torch.tensor([[0.6], [0.95]]))
 
@@ -117,6 +204,7 @@ def test_online_conditioning_uses_cached_hidden_and_freezes_finished_rows():
 
     assert thinking_time_emb.shape == (2, 1, base.config.thinking_time_embed_dim)
     assert torch.equal(thinking_time_mask, torch.tensor([[True], [False]], device=base.anchor.device))
+    assert base.thinking_time_predictor.last_inputs.shape == (2, 1, predictor_hidden_size)
     assert used_thinking_time[0, 0].item() == pytest.approx(0.6)
     assert used_thinking_time[1, 0].item() == 0.0
     assert torch.allclose(base._cached_last_hidden[0], new_hidden[0])
@@ -141,6 +229,22 @@ def test_training_replay_stats_drop_stale_source_metrics():
     assert set(stats) == {"thinking_time_rollout_error"}
 
 
+def test_training_replay_uses_rollout_prediction_instead_of_gt():
+    wrapper = _DummyWrapper()
+    enable_time_conditioning(wrapper)
+    base = wrapper.model
+
+    _, selected_thinking_time, _ = select_training_thinking_time_embedding(
+        base,
+        gt_thinking_time=torch.tensor([[0.9, 0.9, 0.9]]),
+        rollout_thinking_time=torch.tensor([[0.2, 0.2, 0.2]]),
+        thinking_mask=torch.tensor([[True, True, True]]),
+    )
+
+    assert torch.all(selected_thinking_time >= 0.19)
+    assert torch.all(selected_thinking_time <= 0.21)
+
+
 def test_prepare_trainer_time_conditioning_sets_cached_training_tensors():
     wrapper = _DummyWrapper()
     enable_time_conditioning(wrapper)
@@ -158,6 +262,20 @@ def test_prepare_trainer_time_conditioning_sets_cached_training_tensors():
     assert torch.equal(base._train_thinking_time_mask, torch.tensor([[False, True, True]]))
 
 
+def test_prepare_trainer_time_conditioning_requires_rollout_predictions():
+    wrapper = _DummyWrapper()
+    enable_time_conditioning(wrapper)
+    base = wrapper.model
+
+    with pytest.raises(ValueError, match="rollout_thinking_time must be provided"):
+        prepare_trainer_time_conditioning(
+            base,
+            input_ids=torch.zeros((1, 3), dtype=torch.long),
+            thinking_mask=torch.tensor([[False, True, True]]),
+            rollout_thinking_time=None,
+        )
+
+
 def test_replay_lagged_trace_uses_last_prompt_token_then_last_thinking_token():
     replay_hidden = torch.tensor([[[10.0], [11.0], [20.0], [21.0], [30.0]]])
     lagged_hidden, lagged_mask = build_replay_lagged_predictor_trace(
@@ -170,6 +288,37 @@ def test_replay_lagged_trace_uses_last_prompt_token_then_last_thinking_token():
     assert torch.equal(lagged_hidden[0, 2], replay_hidden[0, 1])
     assert torch.equal(lagged_hidden[0, 3], replay_hidden[0, 2])
     assert torch.equal(lagged_hidden[0, 4], replay_hidden[0, 2])
+
+
+def test_streaming_replay_prediction_matches_materialized_lagged_trace():
+    replay_hidden = torch.tensor(
+        [
+            [[0.1], [0.2], [0.3], [0.4], [0.5]],
+            [[0.6], [0.7], [0.8], [0.9], [1.0]],
+        ]
+    )
+    prompt_mask = torch.tensor([[True, True], [True, True]])
+    thinking_mask = torch.tensor(
+        [[False, False, True, False, True], [False, False, True, True, False]]
+    )
+    predictor = _EchoPredictor()
+
+    lagged_hidden, lagged_mask = build_replay_lagged_predictor_trace(
+        replay_hidden,
+        prompt_mask=prompt_mask,
+        thinking_mask=thinking_mask,
+    )
+    expected = predictor(lagged_hidden, thinking_mask=lagged_mask).clamp(0.0, 1.0)
+
+    actual, actual_mask = predict_replay_thinking_time_from_hidden_trace(
+        predictor,
+        replay_hidden,
+        prompt_mask=prompt_mask,
+        thinking_mask=thinking_mask,
+    )
+
+    assert torch.equal(actual_mask, lagged_mask)
+    assert torch.equal(actual, expected)
 
 
 def test_aux_loss_metrics_use_current_names():

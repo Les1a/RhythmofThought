@@ -6,11 +6,16 @@ import string
 import types
 from math_verify import parse, verify
 
+from time_predictor_warmup import (
+    maybe_run_time_predictor_warmup,
+    validate_time_predictor_warmup_fraction,
+)
+
 
 ANSWER_START = "####"
 ADAPTER_CONFIG_NAME = "adapter_config.json"
 ADAPTER_METADATA_KEY = "rot_metadata"
-ADAPTER_METADATA_SCHEMA_VERSION = 1
+ADAPTER_METADATA_SCHEMA_VERSION = 2
 TRAINING_MODES = frozenset({"grpo", "tgrpo", "thrpo", "hrpo"})
 
 
@@ -43,6 +48,22 @@ def mode_uses_time_conditioning(mode: str) -> bool:
 
 def mode_uses_thinking_residual(mode: str) -> bool:
     return _require_training_mode(mode) in {"hrpo", "thrpo"}
+
+
+def _coerce_positive_int(value, *, field_name: str) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer, got {value!r}") from exc
+    if normalized <= 0:
+        raise ValueError(f"{field_name} must be positive, got {normalized}")
+    return normalized
+
+
+class _StoreWithExplicitFlag(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_explicit", True)
 
 
 def build_training_exp_name(
@@ -112,6 +133,14 @@ def build_adapter_metadata(args, task: str, mode: str) -> dict:
         "residual_r_min": float(args.residual_r_min),
         "residual_r_max": float(args.residual_r_max),
         "thinking_time_loss_weight": float(args.thinking_time_loss_weight) if use_time_conditioning else 0.0,
+        "thinking_time_predictor_num_hidden_states": (
+            _coerce_positive_int(
+                args.thinking_time_predictor_num_hidden_states,
+                field_name="thinking_time_predictor_num_hidden_states",
+            )
+            if use_time_conditioning
+            else None
+        ),
         "lr": float(args.lr),
         "lr_residual_gate": float(args.lr_residual_gate) if use_thinking_residual else None,
         "lr_residual_lambda": float(args.lr_residual_Lambda) if use_thinking_residual else None,
@@ -162,8 +191,51 @@ def load_adapter_metadata(adapter_path: str) -> dict:
     normalized["mode"] = _require_training_mode(normalized.get("mode"))
     if not normalized.get("base_model"):
         raise ValueError(f"{config_path} is missing {ADAPTER_METADATA_KEY}.base_model")
+    if mode_uses_time_conditioning(normalized["mode"]):
+        if "thinking_time_predictor_num_hidden_states" not in normalized:
+            raise ValueError(
+                f"{config_path} is missing {ADAPTER_METADATA_KEY}.thinking_time_predictor_num_hidden_states"
+            )
+        normalized["thinking_time_predictor_num_hidden_states"] = _coerce_positive_int(
+            normalized["thinking_time_predictor_num_hidden_states"],
+            field_name="thinking_time_predictor_num_hidden_states",
+        )
     normalized["temperature"] = float(normalized.get("temperature", 0.5))
     return normalized
+
+
+def resolve_time_conditioning_predictor_num_hidden_states(args, mode: str, checkpoint_path: str | None = None) -> int | None:
+    mode = _require_training_mode(mode)
+    if not mode_uses_time_conditioning(mode):
+        return None
+
+    resolved = _coerce_positive_int(
+        getattr(args, "thinking_time_predictor_num_hidden_states", 4),
+        field_name="thinking_time_predictor_num_hidden_states",
+    )
+    if checkpoint_path is None:
+        args.thinking_time_predictor_num_hidden_states = resolved
+        return resolved
+
+    metadata = load_adapter_metadata(checkpoint_path)
+    checkpoint_value = metadata.get("thinking_time_predictor_num_hidden_states")
+    if checkpoint_value is None:
+        raise ValueError(
+            f"{checkpoint_path} is missing thinking_time_predictor_num_hidden_states in saved metadata"
+        )
+    checkpoint_value = _coerce_positive_int(
+        checkpoint_value,
+        field_name="thinking_time_predictor_num_hidden_states",
+    )
+    is_explicit = bool(getattr(args, "_thinking_time_predictor_num_hidden_states_explicit", False))
+    if is_explicit and resolved != checkpoint_value:
+        raise ValueError(
+            "thinking_time_predictor_num_hidden_states does not match checkpoint metadata: "
+            f"cli={resolved} checkpoint={checkpoint_value}"
+        )
+
+    args.thinking_time_predictor_num_hidden_states = checkpoint_value
+    return checkpoint_value
 
 
 def get_modules_to_save_for_mode(mode: str):
@@ -182,7 +254,13 @@ def get_modules_to_save_for_mode(mode: str):
     return list(modules_to_save)
 
 
-def configure_model_for_training_mode(model, mode: str, *, max_completion_length: int | None = None):
+def configure_model_for_training_mode(
+    model,
+    mode: str,
+    *,
+    max_completion_length: int | None = None,
+    thinking_time_predictor_num_hidden_states: int | None = None,
+):
     """Apply runtime toggles needed by a training mode before PEFT wrapping or adapter load."""
     mode = _require_training_mode(mode)
     if mode == "grpo":
@@ -203,6 +281,11 @@ def configure_model_for_training_mode(model, mode: str, *, max_completion_length
         if max_completion_length <= 0:
             raise ValueError(f"max_completion_length must be positive, got {max_completion_length}")
         inner.config.max_completion_length = max_completion_length
+    if mode_uses_time_conditioning(mode) and thinking_time_predictor_num_hidden_states is not None:
+        inner.config.thinking_time_predictor_num_hidden_states = _coerce_positive_int(
+            thinking_time_predictor_num_hidden_states,
+            field_name="thinking_time_predictor_num_hidden_states",
+        )
 
     if mode_uses_thinking_residual(mode):
         set_thinking_residual_disabled(model, False)
@@ -234,7 +317,16 @@ def load_training_model_and_tokenizer(args, mode: str):
         load_in_8bit=False,
         fast_inference=False,
     )
-    configure_model_for_training_mode(model, mode, max_completion_length=args.max_completion_length)
+    configure_model_for_training_mode(
+        model,
+        mode,
+        max_completion_length=args.max_completion_length,
+        thinking_time_predictor_num_hidden_states=getattr(
+            args,
+            "thinking_time_predictor_num_hidden_states",
+            None,
+        ),
+    )
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer
@@ -322,6 +414,9 @@ def create_training_trainer(args, task: str, dataset, reward_funcs):
     from trl import GRPOTrainer
 
     mode = _require_training_mode(args.mode)
+    args.time_predictor_warmup_fraction = validate_time_predictor_warmup_fraction(
+        getattr(args, "time_predictor_warmup_fraction", 0.2)
+    )
     exp_name = build_training_exp_name(
         model_name=args.model_name,
         task=task,
@@ -333,6 +428,11 @@ def create_training_trainer(args, task: str, dataset, reward_funcs):
         exp_suffix=args.exp_suffix,
     )
     resume_from_checkpoint = resolve_resume_from_checkpoint(exp_name, resume=args.resume)
+    resolve_time_conditioning_predictor_num_hidden_states(
+        args,
+        mode,
+        checkpoint_path=resume_from_checkpoint,
+    )
     model, tokenizer = load_training_model_and_tokenizer(args, mode)
     model = prepare_training_model(model, args, mode)
     attach_adapter_metadata(model, build_adapter_metadata(args, task, mode))
@@ -350,6 +450,24 @@ def create_training_trainer(args, task: str, dataset, reward_funcs):
     )
     configure_trainer_for_mode(trainer, args, mode)
     return trainer, resume_from_checkpoint, mode, exp_name
+
+
+def run_training_with_optional_time_predictor_warmup(
+    trainer,
+    *,
+    args,
+    task: str,
+    mode: str,
+    resume_from_checkpoint: str | None,
+):
+    maybe_run_time_predictor_warmup(
+        trainer,
+        args=args,
+        mode=mode,
+        resume_from_checkpoint=resume_from_checkpoint,
+        task=task,
+    )
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
 
 def create_training_parser(
@@ -395,6 +513,22 @@ def create_training_parser(
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--thinking_time_loss_weight", type=float, default=0.1)
     parser.add_argument("--lr_time_conditioning", type=float, default=1e-4)
+    parser.add_argument(
+        "--time_predictor_warmup_fraction",
+        "--time-predictor-warmup-fraction",
+        dest="time_predictor_warmup_fraction",
+        type=float,
+        default=0.2,
+    )
+    parser.set_defaults(_thinking_time_predictor_num_hidden_states_explicit=False)
+    parser.add_argument(
+        "--thinking_time_predictor_num_hidden_states",
+        "--thinking-time-predictor-num-hidden-states",
+        dest="thinking_time_predictor_num_hidden_states",
+        action=_StoreWithExplicitFlag,
+        type=int,
+        default=4,
+    )
     parser.add_argument("--exp-suffix", "--exp_suffix", dest="exp_suffix", type=str, default="")
     parser.add_argument("--resume", action="store_true", default=False)
     return parser
@@ -429,6 +563,7 @@ def load_eval_model_and_tokenizer(
         model,
         metadata["mode"],
         max_completion_length=metadata.get("max_completion_length"),
+        thinking_time_predictor_num_hidden_states=metadata.get("thinking_time_predictor_num_hidden_states"),
     )
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
