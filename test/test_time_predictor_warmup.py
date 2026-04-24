@@ -1,3 +1,5 @@
+"""Unit tests for the optional time-predictor warmup stage."""
+
 import sys
 from pathlib import Path
 
@@ -173,7 +175,7 @@ def test_maybe_run_time_predictor_warmup_skips_non_time_conditioning_modes(monke
             (),
             {
                 "seed": 7,
-                "lr_time_conditioning": 1e-4,
+                "lr_time_conditioning": 5e-6,
                 "time_predictor_warmup_fraction": 0.2,
             },
         )(),
@@ -200,7 +202,7 @@ def test_maybe_run_time_predictor_warmup_forwards_standard_trainer_logs():
             (),
             {
                 "seed": 7,
-                "lr_time_conditioning": 1e-4,
+                "lr_time_conditioning": 5e-6,
                 "max_grad_norm": 0.1,
                 "time_predictor_warmup_fraction": 1.0,
             },
@@ -225,7 +227,7 @@ def test_maybe_run_time_predictor_warmup_skips_resume(monkeypatch):
             (),
             {
                 "seed": 7,
-                "lr_time_conditioning": 1e-4,
+                "lr_time_conditioning": 5e-6,
                 "time_predictor_warmup_fraction": 0.2,
             },
         )(),
@@ -261,7 +263,7 @@ def test_build_time_predictor_warmup_trainer_uses_isolated_training_args():
             "_Args",
             (),
             {
-                "lr_time_conditioning": 1e-4,
+                "lr_time_conditioning": 5e-6,
                 "lr_residual_gate": 1e-4,
                 "lr_residual_Lambda": 1e-3,
             },
@@ -296,7 +298,7 @@ def test_run_time_predictor_warmup_uses_standard_trainer_and_restores_grad_flags
             "_Args",
             (),
             {
-                "lr_time_conditioning": 1e-4,
+                "lr_time_conditioning": 5e-6,
                 "lr_residual_gate": 1e-4,
                 "lr_residual_Lambda": 1e-3,
             },

@@ -1,3 +1,5 @@
+"""Unit tests for time-conditioning helpers and residual runtime state."""
+
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -121,13 +123,14 @@ def test_predictor_masks_finished_rows():
     assert used_thinking_time[1, 0] == 0.0
 
 
-def test_enable_time_conditioning_defaults_predictor_hidden_state_count_to_four():
+def test_enable_time_conditioning_defaults_predictor_hidden_state_count_to_three():
     wrapper = _DummyWrapper()
     enable_time_conditioning(wrapper)
 
     base = wrapper.model
     predictor = base.thinking_time_predictor
 
+    assert DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES == 3
     assert get_time_conditioning_predictor_num_hidden_states(base.config) == (
         DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES
     )

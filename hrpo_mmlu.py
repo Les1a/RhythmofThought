@@ -1,3 +1,5 @@
+"""Train an MMLU checkpoint through the shared GRPO/TGRPO/HRPO/THRPO stack."""
+
 import unsloth
 from unsloth import FastLanguageModel, PatchFastRL
 PatchFastRL("GRPO", FastLanguageModel)
@@ -18,6 +20,7 @@ os.environ["WANDB_PROJECT"] = "latent-reasoning"
 
 
 def preprocess_mmlu(chunk_size=1000, root='../MMLU_Train_Merged', max_train_samples=None) -> Dataset:
+    """Load the merged MMLU dataset and normalize it into the shared train schema."""
     dataset = Dataset.load_from_disk(root)
     dataset = limit_dataset_samples(dataset, max_train_samples)
     # Cast ClassLabel answer to string to avoid auto-conversion back to int
@@ -30,6 +33,7 @@ def preprocess_mmlu(chunk_size=1000, root='../MMLU_Train_Merged', max_train_samp
 
 
 def main(args):
+    """Create the trainer for MMLU and launch optional warmup plus RL training."""
     dataset = preprocess_mmlu(
         chunk_size=500,
         root=args.dataset_root,
@@ -52,6 +56,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = create_training_parser(
+        description=(
+            "Train MMLU with the shared GRPO/TGRPO/HRPO/THRPO entrypoint. "
+            "Use --mode to select the training behavior."
+        ),
         group_size=8,
         per_device_train_batch_size=16,
         max_prompt_length=1024,

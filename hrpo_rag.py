@@ -1,3 +1,5 @@
+"""Train a RAG checkpoint through the shared GRPO/TGRPO/HRPO/THRPO stack."""
+
 import unsloth
 from unsloth import FastLanguageModel, PatchFastRL
 PatchFastRL("GRPO", FastLanguageModel)
@@ -17,6 +19,7 @@ os.environ["WANDB_PROJECT"] = "latent-reasoning"
 
 
 def preprocess_rag(chunk_size=1000, root='../RAG_Train_Merged', max_train_samples=None) -> Dataset:
+    """Load the merged RAG dataset and normalize it into the shared train schema."""
     dataset = Dataset.load_from_disk(root)
     dataset = limit_dataset_samples(dataset, max_train_samples)
     processed = dataset.map(process_rag, batched=True,
@@ -25,6 +28,7 @@ def preprocess_rag(chunk_size=1000, root='../RAG_Train_Merged', max_train_sample
 
 
 def main(args):
+    """Create the trainer for RAG and launch optional warmup plus RL training."""
     dataset = preprocess_rag(
         chunk_size=500,
         root=args.dataset_root,
@@ -47,6 +51,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = create_training_parser(
+        description=(
+            "Train RAG with the shared GRPO/TGRPO/HRPO/THRPO entrypoint. "
+            "Use --mode to select the training behavior."
+        ),
         group_size=4,
         per_device_train_batch_size=16,
         max_prompt_length=2048,

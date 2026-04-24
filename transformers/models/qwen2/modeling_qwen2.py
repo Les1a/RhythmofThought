@@ -648,7 +648,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         hidden_states = inputs_embeds
 
-        # Time conditioning: dual mode (GT for training, predictor for rollout/inference)
+        # Time conditioning has two sources: replay training uses cached embeddings
+        # prepared by TRL; rollout/inference predicts from the lagged hidden cache.
         thinking_time_emb = None
         thinking_time_mask = None
         _is_thinking = flash_attn_kwargs.get('is_thinking', None)
@@ -656,11 +657,11 @@ class Qwen2Model(Qwen2PreTrainedModel):
         if has_time_conditioning(self):
             _gt = getattr(self, '_train_thinking_time_emb', None)
             if _gt is not None:
-                # GT mode (training): use pre-computed thinking-time embeddings
+                # Replay training: use pre-computed thinking-time embeddings.
                 thinking_time_emb = _gt
                 thinking_time_mask = getattr(self, '_train_thinking_time_mask', None)
             else:
-                # Predictor mode (rollout/inference): use cached hidden state
+                # Rollout/inference: use cached hidden state from the prior step.
                 from time_conditioning import prepare_online_thinking_time_conditioning
                 thinking_time_emb, thinking_time_mask, _ = prepare_online_thinking_time_conditioning(
                     self,

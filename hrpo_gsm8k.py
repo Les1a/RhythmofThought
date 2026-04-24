@@ -1,3 +1,5 @@
+"""Train a GSM8K checkpoint through the shared GRPO/TGRPO/HRPO/THRPO stack."""
+
 import unsloth
 from unsloth import FastLanguageModel, PatchFastRL
 PatchFastRL("GRPO", FastLanguageModel)
@@ -17,6 +19,7 @@ os.environ["WANDB_PROJECT"] = "latent-reasoning"
 
 
 def preprocess_gsm8k(split="train", chunk_size=1000, max_train_samples=None) -> Dataset:
+    """Load GSM8K and convert it into the shared prompt/answer training schema."""
     dataset = load_dataset('openai/gsm8k', 'main')[split]
     dataset = limit_dataset_samples(dataset, max_train_samples)
     return dataset.map(process_gsm8k, batched=True, 
@@ -24,6 +27,7 @@ def preprocess_gsm8k(split="train", chunk_size=1000, max_train_samples=None) -> 
 
 
 def main(args):
+    """Create the trainer for GSM8K and launch optional warmup plus RL training."""
     dataset = preprocess_gsm8k('train', chunk_size=500, max_train_samples=args.max_train_samples)
     trainer, resume_from_checkpoint, mode, _ = create_training_trainer(
         args,
@@ -42,6 +46,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = create_training_parser(
+        description=(
+            "Train GSM8K with the shared GRPO/TGRPO/HRPO/THRPO entrypoint. "
+            "Use --mode to select the training behavior."
+        ),
         group_size=4,
         per_device_train_batch_size=8,
         max_prompt_length=1024,

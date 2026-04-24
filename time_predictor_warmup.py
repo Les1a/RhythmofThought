@@ -1,4 +1,9 @@
-"""Predictor warmup helpers for time-conditioning training modes."""
+"""Predictor-only warmup helpers for time-conditioning training modes.
+
+Warmup reuses the standard GRPO trainer path on a deterministic subset, freezes
+all non-predictor parameters, disables checkpoint/report side effects, and is
+skipped for non-time-conditioned modes or resumed runs.
+"""
 
 import copy
 import gc
@@ -17,7 +22,7 @@ from time_conditioning import (
 
 
 def validate_time_predictor_warmup_fraction(value):
-    """Normalize and validate the configured warmup fraction."""
+    """Normalize and validate the configured dataset fraction for warmup."""
     try:
         fraction = float(value)
     except (TypeError, ValueError) as exc:
@@ -33,7 +38,7 @@ def validate_time_predictor_warmup_fraction(value):
 
 
 def build_time_predictor_warmup_dataset(dataset, fraction, seed):
-    """Return a deterministic shuffled subset for predictor warmup."""
+    """Return a deterministic shuffled subset sized with ceil(len(dataset) * fraction)."""
     fraction = validate_time_predictor_warmup_fraction(fraction)
     if fraction == 0.0 or len(dataset) == 0:
         return None, 0
@@ -176,7 +181,7 @@ def maybe_run_time_predictor_warmup(
     task,
     log_metrics_fn=None,
 ):
-    """Gate and launch predictor warmup for time-conditioning modes."""
+    """Gate and launch predictor warmup for fresh TGRPO/THRPO runs."""
     fraction = validate_time_predictor_warmup_fraction(
         getattr(args, "time_predictor_warmup_fraction", 0.0)
     )

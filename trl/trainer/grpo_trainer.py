@@ -723,7 +723,7 @@ class GRPOTrainer(Trainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # Training-time AdaLN conditioning setup
+        # Replay-time AdaLN conditioning setup from rollout thinking metadata.
         _thinking_time_loss_w = getattr(self, 'thinking_time_loss_weight', 0)
         thinking_mask = inputs.get("thinking_mask")
         from time_conditioning import prepare_time_conditioning_training_step
@@ -756,7 +756,7 @@ class GRPOTrainer(Trainer):
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
-        # Time predictor auxiliary loss
+        # Time predictor auxiliary loss, aligned to the rollout lag contract.
         if _thinking_time_loss_w > 0 and _base is not None and _gt_thinking_time is not None:
             from time_conditioning import compute_thinking_time_aux_loss
 

@@ -783,7 +783,8 @@ def LlamaModel_fast_forward(
 
     hidden_states = inputs_embeds
 
-    # Time conditioning: dual mode (GT for training, predictor for rollout/inference)
+    # Time conditioning has two sources: replay training uses cached embeddings
+    # prepared by TRL; rollout/inference predicts from the lagged hidden cache.
     _thinking_time_emb = None
     _thinking_time_mask = None
     from time_conditioning import has_time_conditioning
@@ -795,11 +796,11 @@ def LlamaModel_fast_forward(
         _tc_num_hidden_states = get_time_conditioning_predictor_num_hidden_states(self.config)
         _gt = getattr(self, '_train_thinking_time_emb', None)
         if _gt is not None:
-            # GT mode (training): use pre-computed thinking-time embeddings
+            # Replay training: use pre-computed thinking-time embeddings.
             _thinking_time_emb = _gt
             _thinking_time_mask = getattr(self, '_train_thinking_time_mask', None)
         else:
-            # Predictor mode (rollout/inference)
+            # Rollout/inference: use cached hidden state from the prior step.
             from time_conditioning import prepare_online_thinking_time_conditioning
             _thinking_time_emb, _thinking_time_mask, _ = prepare_online_thinking_time_conditioning(
                 self,

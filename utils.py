@@ -1,3 +1,11 @@
+"""Shared CLI, mode, metadata, reward, and answer-normalization helpers.
+
+Top-level training scripts stay task-specific for dataset loading and rewards,
+while this module owns the common GRPO-family contract: explicit mode parsing,
+experiment naming, resume resolution, adapter metadata, model restoration, and
+the parser options shared by direct Python entrypoints and shell launchers.
+"""
+
 import argparse
 import json
 import os
@@ -20,6 +28,7 @@ TRAINING_MODES = frozenset({"grpo", "tgrpo", "thrpo", "hrpo"})
 
 
 def normalize_exp_suffix(suffix: str | None) -> str:
+    """Sanitize an optional experiment suffix for safe directory names."""
     if suffix is None:
         return ""
     suffix = suffix.strip()
@@ -30,6 +39,7 @@ def normalize_exp_suffix(suffix: str | None) -> str:
 
 
 def is_wandb_disabled() -> bool:
+    """Return whether WandB logging is disabled through environment variables."""
     return (
         os.environ.get("WANDB_DISABLED", "").lower() == "true"
         or os.environ.get("WANDB_MODE", "").lower() == "disabled"
@@ -37,20 +47,24 @@ def is_wandb_disabled() -> bool:
 
 
 def _require_training_mode(mode: str) -> str:
+    """Validate a training mode string and return the normalized value."""
     if mode not in TRAINING_MODES:
         raise ValueError(f"unknown training mode: {mode}")
     return mode
 
 
 def mode_uses_time_conditioning(mode: str) -> bool:
+    """Return whether a mode enables the time-conditioning stack."""
     return _require_training_mode(mode) in {"tgrpo", "thrpo"}
 
 
 def mode_uses_thinking_residual(mode: str) -> bool:
+    """Return whether a mode enables the hybrid residual reasoning path."""
     return _require_training_mode(mode) in {"hrpo", "thrpo"}
 
 
 def _coerce_positive_int(value, *, field_name: str) -> int:
+    """Convert a user-facing numeric value into a validated positive integer."""
     try:
         normalized = int(value)
     except (TypeError, ValueError) as exc:
@@ -61,6 +75,7 @@ def _coerce_positive_int(value, *, field_name: str) -> int:
 
 
 class _StoreWithExplicitFlag(argparse.Action):
+    """Argparse action that records whether a value was set explicitly."""
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, values)
         setattr(namespace, f"_{self.dest}_explicit", True)
@@ -74,8 +89,10 @@ def build_training_exp_name(
     lora_rank,
     temperature,
     residual_r_min=None,
+    thinking_time_predictor_num_hidden_states=None,
     exp_suffix="",
 ):
+    """Build the canonical experiment directory name for a task, mode, and runtime knobs."""
     mode = _require_training_mode(mode)
 
     parts = [
@@ -90,6 +107,16 @@ def build_training_exp_name(
             raise ValueError(f"residual_r_min is required for mode={mode}")
         parts.append(f"rmin{residual_r_min}")
     parts.append(f"temp{temperature}")
+    if mode_uses_time_conditioning(mode):
+        if thinking_time_predictor_num_hidden_states is None:
+            raise ValueError(
+                f"thinking_time_predictor_num_hidden_states is required for mode={mode}"
+            )
+        predictor_hidden_states = _coerce_positive_int(
+            thinking_time_predictor_num_hidden_states,
+            field_name="thinking_time_predictor_num_hidden_states",
+        )
+        parts.append(f"last{predictor_hidden_states}")
 
     exp_suffix = normalize_exp_suffix(exp_suffix)
     if exp_suffix:
@@ -99,6 +126,7 @@ def build_training_exp_name(
 
 
 def resolve_resume_from_checkpoint(exp_name: str, resume: bool) -> str | None:
+    """Resolve the latest checkpoint path when `--resume` is requested."""
     if resume:
         if not os.path.exists(exp_name):
             raise ValueError(f"--resume specified but {exp_name} does not exist.")
@@ -115,6 +143,7 @@ def resolve_resume_from_checkpoint(exp_name: str, resume: bool) -> str | None:
 
 
 def build_adapter_metadata(args, task: str, mode: str) -> dict:
+    """Serialize the runtime configuration that eval and resume treat as authoritative."""
     mode = _require_training_mode(mode)
     use_time_conditioning = mode_uses_time_conditioning(mode)
     use_thinking_residual = mode_uses_thinking_residual(mode)
@@ -149,6 +178,7 @@ def build_adapter_metadata(args, task: str, mode: str) -> dict:
 
 
 def attach_adapter_metadata(model, metadata: dict) -> None:
+    """Inject repository metadata into the PEFT config's serialized payload."""
     peft_config = getattr(model, "peft_config", None)
     if peft_config is None:
         raise ValueError("model does not expose peft_config for adapter metadata attachment")
@@ -169,6 +199,7 @@ def attach_adapter_metadata(model, metadata: dict) -> None:
 
 
 def load_adapter_metadata(adapter_path: str) -> dict:
+    """Load and validate repository-specific adapter metadata from disk."""
     config_path = os.path.join(adapter_path, ADAPTER_CONFIG_NAME)
     if not os.path.exists(config_path):
         raise ValueError(f"{config_path} does not exist")
@@ -205,12 +236,13 @@ def load_adapter_metadata(adapter_path: str) -> dict:
 
 
 def resolve_time_conditioning_predictor_num_hidden_states(args, mode: str, checkpoint_path: str | None = None) -> int | None:
+    """Resolve predictor hidden-state count from CLI defaults or checkpoint metadata."""
     mode = _require_training_mode(mode)
     if not mode_uses_time_conditioning(mode):
         return None
 
     resolved = _coerce_positive_int(
-        getattr(args, "thinking_time_predictor_num_hidden_states", 4),
+        getattr(args, "thinking_time_predictor_num_hidden_states", 3),
         field_name="thinking_time_predictor_num_hidden_states",
     )
     if checkpoint_path is None:
@@ -261,7 +293,7 @@ def configure_model_for_training_mode(
     max_completion_length: int | None = None,
     thinking_time_predictor_num_hidden_states: int | None = None,
 ):
-    """Apply runtime toggles needed by a training mode before PEFT wrapping or adapter load."""
+    """Apply mode-specific runtime toggles before PEFT wrapping or adapter load."""
     mode = _require_training_mode(mode)
     if mode == "grpo":
         if hasattr(model, "answer_start"):
@@ -308,6 +340,7 @@ def reset_residual_lambda_for_mode(model, mode: str, residual_r_min: float, resi
 
 
 def load_training_model_and_tokenizer(args, mode: str):
+    """Load the base model/tokenizer pair and apply the requested runtime mode."""
     from unsloth import FastLanguageModel
 
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -333,6 +366,7 @@ def load_training_model_and_tokenizer(args, mode: str):
 
 
 def prepare_training_model(model, args, mode: str):
+    """Attach LoRA adapters and reset mode-specific trainable state."""
     from unsloth import FastLanguageModel
 
     model = FastLanguageModel.get_peft_model(
@@ -357,6 +391,7 @@ def prepare_training_model(model, args, mode: str):
 
 
 def build_training_config(args, output_dir: str):
+    """Build the shared GRPOConfig used by all task-specific training scripts."""
     from trl import GRPOConfig
     from unsloth import is_bfloat16_supported
 
@@ -394,6 +429,7 @@ def build_training_config(args, output_dir: str):
 
 
 def configure_trainer_for_mode(trainer, args, mode: str):
+    """Apply mode-specific trainer state such as optimizer patching and aux loss."""
     use_time_conditioning = mode_uses_time_conditioning(mode)
     use_thinking_residual = mode_uses_thinking_residual(mode)
     if use_time_conditioning:
@@ -411,12 +447,14 @@ def configure_trainer_for_mode(trainer, args, mode: str):
 
 
 def create_training_trainer(args, task: str, dataset, reward_funcs):
+    """Create the shared trainer and return it with resolved mode, resume path, and output dir."""
     from trl import GRPOTrainer
 
     mode = _require_training_mode(args.mode)
     args.time_predictor_warmup_fraction = validate_time_predictor_warmup_fraction(
         getattr(args, "time_predictor_warmup_fraction", 0.2)
     )
+    predictor_hidden_states = resolve_time_conditioning_predictor_num_hidden_states(args, mode)
     exp_name = build_training_exp_name(
         model_name=args.model_name,
         task=task,
@@ -425,6 +463,7 @@ def create_training_trainer(args, task: str, dataset, reward_funcs):
         lora_rank=args.lora_rank,
         temperature=args.temperature,
         residual_r_min=args.residual_r_min,
+        thinking_time_predictor_num_hidden_states=predictor_hidden_states,
         exp_suffix=args.exp_suffix,
     )
     resume_from_checkpoint = resolve_resume_from_checkpoint(exp_name, resume=args.resume)
@@ -460,6 +499,7 @@ def run_training_with_optional_time_predictor_warmup(
     mode: str,
     resume_from_checkpoint: str | None,
 ):
+    """Run optional predictor-only warmup, then start the main RL trainer."""
     maybe_run_time_predictor_warmup(
         trainer,
         args=args,
@@ -472,53 +512,87 @@ def run_training_with_optional_time_predictor_warmup(
 
 def create_training_parser(
     *,
+    description: str | None = None,
     group_size: int,
     per_device_train_batch_size: int,
     max_prompt_length: int,
     max_completion_length: int,
     dataset_root_default: str | None = None,
 ):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--lora_rank", type=int, default=32)
+    """Build the shared CLI used by all task-specific training entrypoints."""
+    parser = argparse.ArgumentParser(
+        description=description or (
+            "Train a single task with the shared GRPO/TGRPO/HRPO/THRPO entrypoint."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--lora_rank", type=int, default=32, help="LoRA rank for trainable adapters.")
 
-    parser.add_argument("--lr", type=float, default=5e-6)
-    parser.add_argument("--beta", type=float, default=0.005)
-    parser.add_argument("--residual_r_min", type=float, default=0.99)
-    parser.add_argument("--residual_r_max", type=float, default=0.999)
-    parser.add_argument("--lr_residual_gate", type=float, default=1e-4)
-    parser.add_argument("--lr_residual_Lambda", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--warmup_ratio", type=float, default=0.1)
-    parser.add_argument("--lr_scheduler_type", type=str, default="cosine")
-    parser.add_argument("--optimizer", type=str, default="paged_adamw_8bit")
-    parser.add_argument("--max_grad_norm", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=5e-6, help="Base learning rate for LoRA parameters.")
+    parser.add_argument("--beta", type=float, default=0.005, help="KL beta used by GRPO.")
+    parser.add_argument("--residual_r_min", type=float, default=0.99, help="Minimum residual-radius initialization.")
+    parser.add_argument("--residual_r_max", type=float, default=0.999, help="Maximum residual-radius initialization.")
+    parser.add_argument("--lr_residual_gate", type=float, default=1e-4, help="Learning rate for residual gate parameters.")
+    parser.add_argument("--lr_residual_Lambda", type=float, default=1e-3, help="Learning rate for residual-radius parameters.")
+    parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay applied to decayed parameter groups.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.1, help="Warmup ratio for the shared LR scheduler.")
+    parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="Scheduler type passed into GRPOConfig.")
+    parser.add_argument("--optimizer", type=str, default="paged_adamw_8bit", help="Optimizer name passed into GRPOConfig.")
+    parser.add_argument("--max_grad_norm", type=float, default=0.1, help="Gradient clipping threshold.")
 
-    parser.add_argument("--group_size", type=int, default=group_size)
-    parser.add_argument("--temperature", type=float, default=0.5)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--group_size", type=int, default=group_size, help="Number of sampled completions per prompt.")
+    parser.add_argument("--temperature", type=float, default=0.5, help="Sampling temperature used during rollout.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps.")
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
         default=per_device_train_batch_size,
+        help="Per-device batch size before gradient accumulation.",
     )
-    parser.add_argument("--max_steps", type=int, default=-1)
-    parser.add_argument("--max_train_samples", type=int, default=None)
-    parser.add_argument("--max_prompt_length", type=int, default=max_prompt_length)
-    parser.add_argument("--max_completion_length", type=int, default=max_completion_length)
+    parser.add_argument("--max_steps", type=int, default=-1, help="Override trainer max_steps for smoke runs.")
+    parser.add_argument("--max_train_samples", type=int, default=None, help="Limit the dataset before preprocessing.")
+    parser.add_argument("--max_prompt_length", type=int, default=max_prompt_length, help="Maximum prompt token length.")
+    parser.add_argument(
+        "--max_completion_length",
+        type=int,
+        default=max_completion_length,
+        help="Maximum generated completion token length.",
+    )
 
     if dataset_root_default is not None:
-        parser.add_argument("--dataset_root", type=str, default=dataset_root_default)
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--mode", choices=sorted(TRAINING_MODES), required=True)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--thinking_time_loss_weight", type=float, default=0.1)
-    parser.add_argument("--lr_time_conditioning", type=float, default=1e-4)
+        parser.add_argument(
+            "--dataset_root",
+            type=str,
+            default=dataset_root_default,
+            help="Dataset root for tasks that read local merged data.",
+        )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="Qwen/Qwen2.5-1.5B-Instruct",
+        help="Base model name or local path for direct Python entrypoints.",
+    )
+    parser.add_argument("--mode", choices=sorted(TRAINING_MODES), required=True, help="Training mode to run.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for data shuffling and training.")
+    parser.add_argument(
+        "--thinking_time_loss_weight",
+        type=float,
+        default=0.1,
+        help="Auxiliary loss weight for time-conditioning modes.",
+    )
+    parser.add_argument(
+        "--lr_time_conditioning",
+        type=float,
+        default=5e-6,
+        help="Learning rate for time-conditioning modules.",
+    )
     parser.add_argument(
         "--time_predictor_warmup_fraction",
         "--time-predictor-warmup-fraction",
         dest="time_predictor_warmup_fraction",
         type=float,
         default=0.2,
+        help="Fraction of the dataset used for one predictor warmup pass before RL.",
     )
     parser.set_defaults(_thinking_time_predictor_num_hidden_states_explicit=False)
     parser.add_argument(
@@ -527,14 +601,28 @@ def create_training_parser(
         dest="thinking_time_predictor_num_hidden_states",
         action=_StoreWithExplicitFlag,
         type=int,
-        default=4,
+        default=3,
+        help="Number of final hidden states concatenated into the time predictor.",
     )
-    parser.add_argument("--exp-suffix", "--exp_suffix", dest="exp_suffix", type=str, default="")
-    parser.add_argument("--resume", action="store_true", default=False)
+    parser.add_argument(
+        "--exp-suffix",
+        "--exp_suffix",
+        dest="exp_suffix",
+        type=str,
+        default="",
+        help="Optional suffix appended to the computed experiment directory.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume from the latest checkpoint in the computed experiment directory.",
+    )
     return parser
 
 
 def limit_dataset_samples(dataset, max_train_samples: int | None):
+    """Truncate a dataset deterministically when a smoke-test limit is requested."""
     if max_train_samples is None:
         return dataset
 
@@ -550,6 +638,7 @@ def load_eval_model_and_tokenizer(
     *,
     max_seq_length: int,
 ):
+    """Restore the base model, tokenizer, and runtime mode from adapter metadata."""
     from unsloth import FastLanguageModel
     metadata = load_adapter_metadata(adapter_path)
 
@@ -573,6 +662,7 @@ def load_eval_model_and_tokenizer(
 
 
 def build_generation_config(**kwargs):
+    """Create GenerationConfig lazily after Unsloth import ordering is established."""
     # Import Unsloth first so eval scripts do not trigger its transformers-order warning.
     import unsloth  # noqa: F401
     from transformers import GenerationConfig
@@ -580,11 +670,32 @@ def build_generation_config(**kwargs):
     return GenerationConfig(**kwargs)
 
 
-def create_eval_parser():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--no-greedy", dest="greedy", action="store_false", default=True)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--checkpoint_path", type=str, default=None)
+def create_eval_parser(description: str | None = None):
+    """Build the shared CLI used by the evaluation entrypoints."""
+    parser = argparse.ArgumentParser(
+        description=description or "Evaluate a saved adapter checkpoint.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.set_defaults(greedy=True)
+    parser.add_argument(
+        "--greedy",
+        dest="greedy",
+        action="store_true",
+        help="Use greedy decoding during evaluation.",
+    )
+    parser.add_argument(
+        "--no-greedy",
+        dest="greedy",
+        action="store_false",
+        help="Disable greedy decoding and let generation follow the saved sampling setup.",
+    )
+    parser.add_argument("--batch_size", type=int, default=32, help="Evaluation batch size.")
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        required=True,
+        help="Path to the checkpoint directory containing adapter_config.json.",
+    )
     return parser
 
 SYSTEM_PROMPT = (
@@ -597,6 +708,7 @@ SYSTEM_PROMPT = (
 
 
 def extract_from_response(text: str) -> str:
+    """Extract the final answer segment following the `####` answer marker."""
     try:
         answer = text.split(ANSWER_START)[-1].strip()
         if answer.endswith("."):
@@ -607,6 +719,7 @@ def extract_from_response(text: str) -> str:
 
 
 def extract_hash_answer(text: str) -> str | None:
+    """Extract a GSM8K answer that follows the canonical `####` marker."""
     try:
         return text.split("####")[1].strip()
     except IndexError:
@@ -614,6 +727,7 @@ def extract_hash_answer(text: str) -> str | None:
 
 
 def extract_boxed_answer(text: str) -> str | None:
+    """Extract the final boxed expression from a MATH-style solution string."""
     try:  # wrap in boxed for process_math_answer
         return "\\boxed{" + find_box(text).strip() + "}"
     except IndexError:
@@ -621,6 +735,7 @@ def extract_boxed_answer(text: str) -> str | None:
 
 
 def reward_func_math(completions, answer, **kwargs) -> list[float]:
+    """Reward math completions that both format and solve the problem correctly."""
     responses = [completion[0]["content"] for completion in completions]
 
     ans = [parse(a) for a in answer]
@@ -644,6 +759,7 @@ def reward_func_math(completions, answer, **kwargs) -> list[float]:
 
 
 def reward_func_rag(completions, answer, **kwargs) -> list[float]:
+    """Reward RAG completions that match any normalized golden answer."""
     responses = [completion[0]["content"] for completion in completions]
 
     extracted = [extract_from_response(r) for r in responses]
@@ -674,6 +790,7 @@ def reward_func_rag(completions, answer, **kwargs) -> list[float]:
 
 
 def reward_func_mmlu(completions, answer, **kwargs) -> list[float]:
+    """Reward multiple-choice completions that emit the correct answer letter."""
     responses = [completion[0]["content"] for completion in completions]
 
     ans = [process_mmlu_answer(a) for a in answer]
@@ -697,6 +814,7 @@ def reward_func_mmlu(completions, answer, **kwargs) -> list[float]:
 
 
 def delete_extra_zero(n):
+    """Normalize numeric strings by trimming redundant trailing zeroes."""
     try:
         n=float(n)
     except:
@@ -715,6 +833,7 @@ def delete_extra_zero(n):
 
 
 def find_box(pred_str: str):
+    """Extract the content of the final `boxed{...}` expression."""
     ans = pred_str.split("boxed")[-1]
     if not ans:
         return ""
@@ -737,6 +856,7 @@ def find_box(pred_str: str):
 
 
 def find_latex(pred_str: str):
+    """Return the final LaTeX span enclosed by standard math delimiters."""
     pattern = re.compile(
         r"""
         (\\\[(?P<display>[\s\S]+?)\\\])                        # \[ ... \]
@@ -856,6 +976,7 @@ def _strip_string(string):
 
 
 def process_gsm8k_answer(pred: str) -> str:
+    """Normalize a GSM8K answer string into its final numeric form."""
     pred = pred.strip("\n").rstrip(".").rstrip("/").strip(" ")
     pred = [delete_extra_zero(s.replace(",", "")) 
             for s in re.findall(r"-?\d+/?\.?\d*", pred)]
@@ -868,6 +989,7 @@ def process_gsm8k_answer(pred: str) -> str:
 
 
 def process_math_answer(pred: str) -> str:
+    """Normalize a MATH answer into a comparable canonical string."""
     pred = pred.strip("\n").rstrip(".").rstrip("/").strip(" ")
     if "boxed" in pred:
         pred = find_box(pred)
@@ -886,6 +1008,7 @@ def process_math_answer(pred: str) -> str:
 
 
 def process_mmlu_answer(pred: str) -> str:
+    """Normalize a multiple-choice response into a single uppercase answer label."""
     pred = pred.strip("\n").rstrip(".").rstrip("/").strip(" ")
     tmp = re.findall(r"\b(A|B|C|D|E|F|G|H|I|J)\b", pred.upper())
     if tmp:
@@ -901,6 +1024,7 @@ def process_mmlu_answer(pred: str) -> str:
 
 
 def process_qa_answer(pred: str) -> str:
+    """Normalize open-domain QA answers with lowercasing and punctuation stripping."""
     def remove_articles(text):
         return re.sub(r"\b(a|an|the)\b", " ", text)
 
@@ -918,6 +1042,7 @@ def process_qa_answer(pred: str) -> str:
 
 
 def process_gsm8k(batch):
+    """Convert a GSM8K batch into the shared prompt/answer training schema."""
     prompts = [[
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": q.strip()},
@@ -930,6 +1055,7 @@ def process_gsm8k(batch):
 
 
 def process_math(batch):
+    """Convert a MATH batch into the shared prompt/answer training schema."""
     prompts = [[
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": q.strip()},
@@ -942,6 +1068,7 @@ def process_math(batch):
 
 
 def process_mmlu(batch):
+    """Convert an MMLU batch into the shared prompt/answer training schema."""
     def get_prompt(question, choices):
         prompt = f"Question: {question}\nOptions:\n"
         for i, choice in enumerate(choices):
@@ -960,6 +1087,7 @@ def process_mmlu(batch):
 
 
 def process_rag(batch, topk=3):
+    """Convert a RAG batch into the shared prompt/answer training schema."""
     def get_prompt(question, contexts):
         prompt = "Context (which may or may not be relevant):\n"
         for context in contexts[:topk]:

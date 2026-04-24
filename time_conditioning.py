@@ -1,4 +1,12 @@
-"""Time-conditioning modules and runtime helpers for TGRPO/THRPO."""
+"""Time-conditioning modules and runtime helpers for TGRPO/THRPO.
+
+The stack predicts normalized thinking progress from lagged hidden states,
+embeds that scalar into Fourier-style features, and applies per-layer AdaLN
+modulation only while a generated sample is still in the thinking span. Rollout
+uses cached one-step-lag hidden states; replay rebuilds the same lagged contract
+from trainer hidden traces so auxiliary supervision does not peek at future
+tokens.
+"""
 
 import math
 
@@ -11,7 +19,7 @@ TIME_CONDITIONING_MODULE_NAMES = (
     "thinking_time_predictor",
     "reasoning_time_embedding",
 )
-DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES = 4
+DEFAULT_TIME_CONDITIONING_PREDICTOR_NUM_HIDDEN_STATES = 3
 THINKING_RESIDUAL_MODULE_NAMES = (
     "thinking_residual_gate_r",
     "thinking_residual_gate_i",
@@ -115,7 +123,7 @@ def concat_time_conditioning_hidden_states(hidden_states, num_hidden_states=None
 
 
 class ThinkingTimePredictor(nn.Module):
-    """Predict per-token thinking time logits independently in [0, 1]."""
+    """Predict normalized thinking progress from concatenated recent hidden states."""
 
     def __init__(self, hidden_size):
         super().__init__()
@@ -155,7 +163,7 @@ class ThinkingTimePredictor(nn.Module):
 
 
 class ReasoningTimeEmbedding(nn.Module):
-    """Map scalar thinking-time values to compact Fourier features with learnable bandwidth."""
+    """Map scalar thinking-time values to Fourier features with learnable bandwidth."""
 
     def __init__(
         self,
@@ -246,7 +254,7 @@ class ReasoningTimeEmbedding(nn.Module):
 
 
 class AdaLNProjection(nn.Module):
-    """Per-layer AdaLN projection for two norm/residual sites."""
+    """Project a time embedding into bounded AdaLN chunks for two layer sites."""
 
     def __init__(
         self,
@@ -366,7 +374,7 @@ def select_training_thinking_time_embedding(
     rollout_thinking_time=None,
     thinking_mask=None,
 ):
-    """Build the training-time replay signal from rollout self-predicted time plus fixed noise."""
+    """Build replay-time conditioning from rollout self-predicted time plus fixed noise."""
     if gt_thinking_time.ndim != 2:
         raise ValueError(
             f"gt_thinking_time must be rank-2 (B, L), got shape {tuple(gt_thinking_time.shape)}"
@@ -420,7 +428,7 @@ def prepare_training_thinking_time_conditioning(
     thinking_mask,
     rollout_thinking_time,
 ):
-    """Populate the cached training-time AdaLN tensors on the inner decoder model."""
+    """Populate cached AdaLN tensors for the inner decoder during replay training."""
     if thinking_mask is None:
         base_model._train_thinking_time_emb = None
         base_model._train_thinking_time_mask = None
@@ -482,7 +490,7 @@ def prepare_time_conditioning_training_step(
     rollout_thinking_time,
     thinking_time_loss_weight=0.0,
 ):
-    """Prepare cached training-time tensors and normalize the trainer-visible mask."""
+    """Normalize trainer masks and prepare cached tensors for one replay forward pass."""
     base_model = None
     gt_thinking_time = None
     source_stats = {}
@@ -521,7 +529,7 @@ def build_replay_lagged_predictor_trace(
     prompt_mask,
     thinking_mask,
 ):
-    """Reconstruct rollout-equivalent lagged predictor inputs from replay hidden states."""
+    """Materialize rollout-equivalent lagged predictor inputs from replay hidden states."""
     if replay_hidden is None:
         raise ValueError("replay_hidden must be provided for time_conditioning aux supervision")
     if replay_hidden.ndim != 3:
@@ -576,7 +584,7 @@ def predict_replay_thinking_time_from_hidden_trace(
     prompt_mask,
     thinking_mask,
 ):
-    """Predict replay thinking time without materializing the full lagged hidden trace."""
+    """Predict replay thinking time while streaming the lagged hidden carry."""
     if replay_hidden is None:
         raise ValueError("replay_hidden must be provided for replay prediction")
     if replay_hidden.ndim != 3:
@@ -668,7 +676,7 @@ def compute_thinking_time_aux_loss(
     prompt_mask,
     rewards=None,
 ):
-    """Compute predictor supervision from replay hidden states with rollout-equivalent lagged carry."""
+    """Compute predictor supervision from replay hidden states using the rollout lag contract."""
     if gt_thinking_time is None or thinking_mask is None:
         return None, {}
 
@@ -823,7 +831,7 @@ def _normalize_step_mask(is_thinking, batch_size, device):
 
 
 def enable_time_conditioning(model):
-    """Attach time-conditioning modules to a loaded base model before LoRA wrapping."""
+    """Attach predictor, time embedding, and AdaLN modules before LoRA wrapping."""
     inner = get_time_conditioning_base_model(model)
     config = inner.config
 

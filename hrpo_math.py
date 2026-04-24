@@ -1,3 +1,5 @@
+"""Train a MATH checkpoint through the shared GRPO/TGRPO/HRPO/THRPO stack."""
+
 import unsloth
 from unsloth import FastLanguageModel, PatchFastRL
 PatchFastRL("GRPO", FastLanguageModel)
@@ -18,6 +20,7 @@ os.environ["WANDB_PROJECT"] = "latent-reasoning"
 
 
 def preprocess_math(split="train", chunk_size=1000, root='../MATH', max_train_samples=None) -> Dataset:
+    """Load local MATH json files and normalize them into the shared train schema."""
     problems, solutions = [], []
     for folder in os.listdir(os.path.join(root, split)):
         for file in os.listdir(os.path.join(root, split, folder)):
@@ -41,6 +44,7 @@ def preprocess_math(split="train", chunk_size=1000, root='../MATH', max_train_sa
 
 
 def main(args):
+    """Create the trainer for MATH and launch optional warmup plus RL training."""
     dataset = preprocess_math(
         'train',
         chunk_size=500,
@@ -64,6 +68,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = create_training_parser(
+        description=(
+            "Train MATH with the shared GRPO/TGRPO/HRPO/THRPO entrypoint. "
+            "Use --mode to select the training behavior."
+        ),
         group_size=8,
         per_device_train_batch_size=16,
         max_prompt_length=2048,

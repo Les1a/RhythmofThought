@@ -1,3 +1,5 @@
+"""Repository-specific trainer patching helpers for GRPO-family modes."""
+
 import types
 from transformers.trainer import *
 
@@ -10,12 +12,14 @@ def patch_trainer_optimizer(
     thinking_residual_Lambda=1e-3,
     lr_time_conditioning=None,
 ):
+    """Replace the trainer optimizer builder with mode-aware parameter grouping."""
     def create_optimizer(self):
         """
-        Setup the optimizer.
+        Build optimizer groups for base, residual, and time-conditioning modules.
 
-        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
-        Trainer's init through `optimizers`, or subclass and override this method in a subclass.
+        Each enabled parameter family is split into decay and no-decay groups.
+        This keeps the repository's custom learning-rate layout close to the
+        training mode instead of spreading that logic across every task script.
         """
         opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
 

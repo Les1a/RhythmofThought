@@ -1,3 +1,5 @@
+"""Unit tests for shared mode, metadata, and parser utilities."""
+
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +20,7 @@ from utils import (
     build_training_exp_name,
     build_adapter_metadata,
     configure_model_for_training_mode,
+    create_eval_parser,
     create_training_parser,
     get_modules_to_save_for_mode,
     load_adapter_metadata,
@@ -67,6 +70,7 @@ def test_build_training_exp_name_normalizes_suffix_without_extra_separator():
         group_size=4,
         lora_rank=32,
         temperature=0.5,
+        thinking_time_predictor_num_hidden_states=3,
         exp_suffix="",
     )
     normalized_suffix = build_training_exp_name(
@@ -77,12 +81,47 @@ def test_build_training_exp_name_normalizes_suffix_without_extra_separator():
         lora_rank=32,
         temperature=0.5,
         residual_r_min=0.99,
+        thinking_time_predictor_num_hidden_states=2,
         exp_suffix="  smoke 2026/04  ",
     )
 
-    assert no_suffix == "./experiments/Qwen2.5-3B-Instruct-gsm8k-tgrpo-group4-lora32-temp0.5"
+    assert no_suffix == "./experiments/Qwen2.5-3B-Instruct-gsm8k-tgrpo-group4-lora32-temp0.5-last3"
     assert not no_suffix.endswith("-")
-    assert normalized_suffix.endswith("-smoke-2026-04")
+    assert normalized_suffix.endswith("-last2-smoke-2026-04")
+
+
+def test_build_training_exp_name_adds_predictor_hidden_state_count_only_for_time_conditioning_modes():
+    tgrpo = build_training_exp_name(
+        model_name="Qwen/Qwen2.5-3B-Instruct",
+        task="gsm8k",
+        mode="tgrpo",
+        group_size=4,
+        lora_rank=32,
+        temperature=0.5,
+        thinking_time_predictor_num_hidden_states=1,
+    )
+    thrpo = build_training_exp_name(
+        model_name="Qwen/Qwen2.5-3B-Instruct",
+        task="gsm8k",
+        mode="thrpo",
+        group_size=4,
+        lora_rank=32,
+        temperature=0.5,
+        residual_r_min=0.99,
+        thinking_time_predictor_num_hidden_states=2,
+    )
+    grpo = build_training_exp_name(
+        model_name="Qwen/Qwen2.5-3B-Instruct",
+        task="gsm8k",
+        mode="grpo",
+        group_size=4,
+        lora_rank=32,
+        temperature=0.5,
+    )
+
+    assert tgrpo.endswith("-last1")
+    assert thrpo.endswith("-last2")
+    assert "-last" not in grpo
 
 
 def test_configure_model_for_training_mode_enables_time_conditioning_only_for_tgrpo_and_thrpo():
@@ -218,6 +257,38 @@ def test_create_training_parser_defaults_time_predictor_warmup_fraction():
     assert args.time_predictor_warmup_fraction == pytest.approx(0.2)
 
 
+def test_create_training_parser_defaults_time_conditioning_knobs_to_launcher_values():
+    parser = create_training_parser(
+        group_size=4,
+        per_device_train_batch_size=8,
+        max_prompt_length=1024,
+        max_completion_length=1024,
+    )
+
+    args = parser.parse_args(["--mode", "tgrpo"])
+
+    assert args.thinking_time_predictor_num_hidden_states == 3
+    assert args.lr_time_conditioning == pytest.approx(5e-6)
+    assert args._thinking_time_predictor_num_hidden_states_explicit is False
+
+
+def test_create_eval_parser_accepts_greedy_aliases():
+    parser = create_eval_parser()
+
+    greedy_args = parser.parse_args(["--checkpoint_path", "ckpt", "--greedy"])
+    sampling_args = parser.parse_args(["--checkpoint_path", "ckpt", "--no-greedy"])
+
+    assert greedy_args.greedy is True
+    assert sampling_args.greedy is False
+
+
+def test_create_eval_parser_requires_checkpoint_path():
+    parser = create_eval_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([])
+
+
 def test_load_adapter_metadata_reads_standard_rot_metadata(tmp_path):
     adapter_dir = tmp_path / "adapter"
     adapter_dir.mkdir()
@@ -252,7 +323,7 @@ def test_build_adapter_metadata_includes_time_conditioning_hidden_state_count():
         lr=5e-6,
         lr_residual_gate=1e-4,
         lr_residual_Lambda=1e-3,
-        lr_time_conditioning=1e-4,
+        lr_time_conditioning=5e-6,
         thinking_time_predictor_num_hidden_states=6,
     )
 
@@ -269,7 +340,7 @@ def test_resolve_time_conditioning_predictor_num_hidden_states_uses_checkpoint_v
     )
 
     implicit_args = SimpleNamespace(
-        thinking_time_predictor_num_hidden_states=4,
+        thinking_time_predictor_num_hidden_states=3,
         _thinking_time_predictor_num_hidden_states_explicit=False,
     )
     resolved = resolve_time_conditioning_predictor_num_hidden_states(
