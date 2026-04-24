@@ -1,3 +1,5 @@
+"""Evaluate a saved checkpoint on the repository's RAG benchmarks."""
+
 import os
 import json
 from datetime import datetime
@@ -15,6 +17,7 @@ from utils import (
 
 
 def get_prompt(question, contexts, topk=3):
+    """Build the retrieval-augmented prompt from the top-k stored contexts."""
     prompt = "Context (which may or may not be relevant):\n"
     for context in contexts[:topk]:
         cur_context = context.split("\n")
@@ -43,6 +46,7 @@ def evaluate_benchmark(
     save_results: bool = True,
     dataset_code: str = 'nq',
 ):
+    """Run batched evaluation for one RAG benchmark and save per-example outputs."""
     dataset = Dataset.load_from_disk(DATASET_PATHS[dataset_code])
 
     if num_samples and len(dataset) > num_samples:
@@ -159,7 +163,13 @@ def evaluate_benchmark(
 
 
 if __name__ == "__main__":
-    parser = create_eval_parser()
+    parser = create_eval_parser(
+        description=(
+            "Evaluate a checkpoint on the repository's RAG benchmarks. The "
+            "evaluator restores the base model, mode, and temperature from "
+            "adapter metadata."
+        )
+    )
     parser.add_argument("--eval_examples", type=int, default=None)
     args = parser.parse_args()
 

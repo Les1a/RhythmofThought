@@ -1,3 +1,5 @@
+"""Evaluate a saved checkpoint on the MMLU-STEM benchmark."""
+
 import os
 import json
 from collections import defaultdict
@@ -22,7 +24,9 @@ def evaluate_model(
     num_samples: int = None,
     save_results: bool = True,
 ):
+    """Run batched MMLU-STEM evaluation and record per-subject accuracies."""
     def get_prompt(question, choices):
+        """Format a multiple-choice prompt with explicit answer letters."""
         prompt = f"Question: {question}\nOptions:\n"
         for i, choice in enumerate(choices):
             prompt += f"{chr(65 + i)}. {choice}\n"
@@ -157,7 +161,12 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
-    args = create_eval_parser().parse_args()
+    args = create_eval_parser(
+        description=(
+            "Evaluate a checkpoint on MMLU-STEM. The evaluator restores the base "
+            "model, mode, and temperature from adapter metadata."
+        )
+    ).parse_args()
     checkpoint_path = args.checkpoint_path
     print(f"Starting MMLU-STEM evaluation metadata load from {checkpoint_path}")
 

@@ -1,3 +1,5 @@
+"""Evaluate a saved checkpoint on GSM8K using adapter metadata restoration."""
+
 import os
 import json
 from datetime import datetime
@@ -22,6 +24,7 @@ def evaluate_model(
     num_samples: int = None,
     save_results: bool = True,
 ):
+    """Run batched GSM8K evaluation and optionally persist per-example outputs."""
     model, tokenizer, metadata = load_eval_model_and_tokenizer(
         adapter_path,
         max_seq_length=2048,
@@ -145,7 +148,12 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
-    args = create_eval_parser().parse_args()
+    args = create_eval_parser(
+        description=(
+            "Evaluate a checkpoint on GSM8K. The evaluator restores the base "
+            "model, mode, and temperature from adapter metadata."
+        )
+    ).parse_args()
     checkpoint_path = args.checkpoint_path
     print(f"Starting GSM8K evaluation metadata load from {checkpoint_path}")
 

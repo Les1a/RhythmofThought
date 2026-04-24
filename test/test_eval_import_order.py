@@ -1,3 +1,5 @@
+"""Regression tests for lazy import behavior in evaluation entrypoints."""
+
 import importlib
 import sys
 import types
@@ -19,6 +21,7 @@ EVAL_MODULES = [
 
 
 def _pop_modules(*prefixes: str) -> dict[str, object]:
+    """Remove matching modules from `sys.modules` and return them for restoration."""
     removed = {}
     for name in list(sys.modules):
         if any(name == prefix or name.startswith(prefix + ".") for prefix in prefixes):
@@ -27,6 +30,7 @@ def _pop_modules(*prefixes: str) -> dict[str, object]:
 
 
 def _install_eval_import_stubs() -> None:
+    """Install minimal dependency stubs so import-order tests stay lightweight."""
     datasets_module = types.ModuleType("datasets")
     datasets_module.load_dataset = lambda *args, **kwargs: None
 

@@ -1,3 +1,5 @@
+"""Evaluate a saved checkpoint on ARC-style multiple-choice benchmarks."""
+
 import os
 import json
 from datetime import datetime
@@ -22,7 +24,9 @@ def evaluate_model(
     save_results: bool = True,
     dataset_code: str = 'ai2_arc',
 ):
+    """Run batched evaluation on ARC-C, OpenBookQA, or QASC and save results."""
     def get_prompt(question, choices):
+        """Format a multiple-choice question with lettered options."""
         prompt = f"Question: {question}\nOptions:\n"
         for i, choice in enumerate(choices):
             prompt += f"{chr(65 + i)}. {choice}\n"
@@ -154,7 +158,12 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
-    args = create_eval_parser().parse_args()
+    args = create_eval_parser(
+        description=(
+            "Evaluate a checkpoint on ARC-style benchmarks. The evaluator restores "
+            "the base model, mode, and temperature from adapter metadata."
+        )
+    ).parse_args()
     checkpoint_path = args.checkpoint_path
     print(f"Starting ARC-C evaluation metadata load from {checkpoint_path}")
 

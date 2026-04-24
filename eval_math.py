@@ -1,3 +1,5 @@
+"""Evaluate a saved checkpoint on MATH and report the MATH-500 subset score."""
+
 import os
 import json
 from datetime import datetime
@@ -17,6 +19,7 @@ from utils import (
 
 
 def preprocess_math(split="train", chunk_size=1000, root='../MATH') -> Dataset:
+    """Load the local MATH directory and normalize it into the shared eval schema."""
     problems, solutions = [], []
     for folder in os.listdir(os.path.join(root, split)):
         for file in os.listdir(os.path.join(root, split, folder)):
@@ -41,6 +44,7 @@ def evaluate_model(
     num_samples: int = None,
     save_results: bool = True,
 ):
+    """Run batched MATH evaluation and track both full and MATH-500 accuracy."""
     model, tokenizer, metadata = load_eval_model_and_tokenizer(
         adapter_path,
         max_seq_length=4096,
@@ -179,7 +183,12 @@ def evaluate_model(
 
 
 if __name__ == "__main__":
-    args = create_eval_parser().parse_args()
+    args = create_eval_parser(
+        description=(
+            "Evaluate a checkpoint on MATH. The evaluator restores the base "
+            "model, mode, and temperature from adapter metadata."
+        )
+    ).parse_args()
     checkpoint_path = args.checkpoint_path
     print(f"Starting MATH evaluation metadata load from {checkpoint_path}")
 
