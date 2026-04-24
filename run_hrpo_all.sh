@@ -26,10 +26,10 @@
 #   --mode MODE           Internal override: hrpo or thrpo (default: hrpo)
 #   --thinking-time-loss-weight V
 #                         Thinking-time auxiliary loss weight (default: 0.1)
-#   --lr-time-cond V      Learning rate for time conditioning modules (default: 1e-4)
+#   --lr-time-cond V      Learning rate for time conditioning modules (default: 5e-6)
 #   --predictor-hidden-states N
 #                         Number of final output hidden states concatenated for
-#                         the time-conditioning predictor (default: 4)
+#                         the time-conditioning predictor (default: 3)
 #   --time-predictor-warmup-fraction V
 #                         Fraction of the training dataset used for one-pass
 #                         predictor warmup before RL (default: 0.2)
@@ -50,7 +50,7 @@ LOG_DIR="${WORK_DIR}/logs"
 CONDA_ENV="rot"
 
 # ========================= Paper-Official Hyperparameters ====================
-MODEL="Qwen/Qwen2.5-3B-Instruct"
+MODEL="Qwen/Qwen2.5-3B-Instruct" # "Qwen/Qwen2.5-3B-Instruct"  # "meta-llama/Llama-3.2-3B-Instruct"
 SEED=42
 LR=5e-6
 BETA=0.005
@@ -87,7 +87,7 @@ RESUME=false
 MODE="hrpo"
 THINKING_TIME_LOSS_WEIGHT=0.1
 LR_TIME_CONDITIONING=5e-6
-THINKING_TIME_PREDICTOR_NUM_HIDDEN_STATES=2
+THINKING_TIME_PREDICTOR_NUM_HIDDEN_STATES=3
 TIME_PREDICTOR_WARMUP_FRACTION=0.2
 EXP_SUFFIX=""
 MAX_STEPS=-1
@@ -171,14 +171,31 @@ get_exp_name() {
     local task="$1"
     local group_size="$2"
     local model_short="${MODEL##*/}"
+    local predictor_segment=""
     local suffix_segment=""
+    [ "$MODE" = "thrpo" ] && predictor_segment="-last${THINKING_TIME_PREDICTOR_NUM_HIDDEN_STATES}"
     [ -n "$EXP_SUFFIX" ] && suffix_segment="-${EXP_SUFFIX}"
-    echo "./experiments/${model_short}-${task}-${MODE}-group${group_size}-lora${LORA_RANK}-rmin${RESIDUAL_R_MIN}-temp${TEMPERATURE}${suffix_segment}"
+    echo "./experiments/${model_short}-${task}-${MODE}-group${group_size}-lora${LORA_RANK}-rmin${RESIDUAL_R_MIN}-temp${TEMPERATURE}${predictor_segment}${suffix_segment}"
 }
 
 find_latest_checkpoint() {
     local exp_dir="$1"
-    ls -d "${exp_dir}"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1
+    local checkpoint basename step
+    local latest=""
+    local latest_step=-1
+
+    for checkpoint in "${exp_dir}"/checkpoint-*; do
+        [ -d "$checkpoint" ] || continue
+        basename="${checkpoint##*/}"
+        step="${basename#checkpoint-}"
+        [[ "$step" =~ ^[0-9]+$ ]] || continue
+        if (( step > latest_step )); then
+            latest_step="$step"
+            latest="$checkpoint"
+        fi
+    done
+
+    printf '%s\n' "$latest"
 }
 
 dry_run_checkpoint_hint() {
@@ -189,6 +206,37 @@ dry_run_checkpoint_hint() {
         echo "$ckpt"
     else
         echo "${exp_dir}/checkpoint-<latest>"
+    fi
+}
+
+parse_task_list() {
+    TASK_LIST=()
+    if [ "$TASKS" = "all" ]; then
+        TASK_LIST=(gsm8k math mmlu rag)
+        return 0
+    fi
+
+    local raw_tasks=()
+    local raw_task task
+    IFS=',' read -ra raw_tasks <<< "$TASKS"
+    for raw_task in "${raw_tasks[@]}"; do
+        task="${raw_task#"${raw_task%%[![:space:]]*}"}"
+        task="${task%"${task##*[![:space:]]}"}"
+        [ -z "$task" ] && continue
+        case "$task" in
+            gsm8k|math|mmlu|rag)
+                TASK_LIST+=("$task")
+                ;;
+            *)
+                echo "Unknown task: ${task} (valid: gsm8k,math,mmlu,rag or all)" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ ${#TASK_LIST[@]} -eq 0 ]; then
+        echo "No tasks selected (valid: gsm8k,math,mmlu,rag or all)" >&2
+        exit 1
     fi
 }
 
@@ -645,12 +693,7 @@ main() {
     log "MAIN" "Resume:      ${RESUME}"
     log "MAIN" "WandB:       $([ "$NO_WANDB" = true ] && echo 'disabled' || echo 'enabled')"
 
-    # Parse task list
-    if [ "$TASKS" = "all" ]; then
-        TASK_LIST=(gsm8k math mmlu rag)
-    else
-        IFS=',' read -ra TASK_LIST <<< "$TASKS"
-    fi
+    parse_task_list
 
     # Setup
     mkdir -p "${LOG_DIR}"

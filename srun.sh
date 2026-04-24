@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# srun.sh — Submit repository commands to Slurm with workspace defaults.
 set -euo pipefail
 
 usage() {
