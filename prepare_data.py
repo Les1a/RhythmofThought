@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """
-prepare_data.py — Unified training + evaluation data preparation for HRPO/GRPO.
+prepare_data.py — Unified train/eval data preparation for GRPO/TGRPO/HRPO/THRPO.
 
 Single entry point that replaces the four legacy scripts
 (prepare_eval_data.py, prepare_math_data.py, prepare_mmlu_train_data.py,
 prepare_rag_train_data.py) with a task/stage-driven CLI matching the style
-of run_hrpo_all.sh's --tasks flag.
+of the run_*_all.sh launcher --tasks flag.
 
 Usage:
   # Default: prepare train + eval for all tasks
@@ -80,10 +80,12 @@ RETRIEVAL_DATASETS = {
 # ============================================================================
 
 def log(task, msg):
+    """Emit a one-line task-scoped log message."""
     print(f"[{task}] {msg}", flush=True)
 
 
 def log_section(title):
+    """Print a section divider for long-running preparation steps."""
     bar = "=" * 60
     print(f"\n{bar}\n  {title}\n{bar}", flush=True)
 
@@ -469,6 +471,7 @@ ALL_TASKS = ("gsm8k", "math", "mmlu", "rag")
 
 
 def _parse_tasks(tasks_arg):
+    """Parse the `--tasks` flag into a validated task list."""
     if tasks_arg == "all":
         return list(ALL_TASKS)
     out = []
@@ -483,8 +486,9 @@ def _parse_tasks(tasks_arg):
 
 
 def main():
+    """CLI entrypoint for preparing repository datasets and verifying outputs."""
     parser = argparse.ArgumentParser(
-        description="Unified HRPO/GRPO data preparation (train + eval)",
+        description="Unified GRPO/TGRPO/HRPO/THRPO data preparation (train + eval)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(

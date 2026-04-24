@@ -1,21 +1,23 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides high-level orientation for Claude Code when working in this repository. It is intentionally shorter than the reproduction guide and should be read as a workspace map, not as the final source of truth.
 
 ## Authoritative Reference
 
-**`HRPO_REPRODUCTION_GUIDE.md` is the source of truth** for architecture, hyperparameters, dataset prep, eval pipeline, version pinning, and known gotchas. Read it before making non-trivial changes. This file is the high-level orientation; the guide is the detail.
+**`HRPO_REPRODUCTION_GUIDE.md` is the source of truth** for architecture, hyperparameters, dataset prep, evaluation flow, version pinning, and known gotchas. Read it before making non-trivial changes. This file is the short orientation; the guide carries the detail.
 
 ## What This Repo Is
 
-PyTorch implementation of **HRPO** (Hybrid Latent Reasoning via Reinforcement Learning, [arXiv:2505.18454](https://arxiv.org/abs/2505.18454)). Core idea: during generation, while the model has not yet emitted the answer marker `####`, blend the prior hidden state into the current token embedding via a learnable gate (`ThinkingResidualLambda`). After `####`, generation reverts to pure token embeddings. Training is GRPO-based via TRL + Unsloth.
+PyTorch implementation of **HRPO** (Hybrid Latent Reasoning via Reinforcement Learning, [arXiv:2505.18454](https://arxiv.org/abs/2505.18454)). Core idea: during generation, while the model has not yet emitted the answer marker `####`, blend the previous hidden state into the current token embedding via a learnable gate (`ThinkingResidualLambda`). After `####`, generation returns to the pure token path. Training is GRPO-based and runs through TRL plus Unsloth.
+
+When the requested change is documentation-only or CLI-surface-only, start with the project-owned top-level files before touching vendored libraries.
 
 ## Vendored Libraries (Critical)
 
 The repo ships **modified copies** of three libraries at the top level — `transformers/`, `trl/`, and `unsloth/`. These are imported directly (no install step). Modifications live in:
 
 - `transformers/models/qwen2/modeling_qwen2.py` and `transformers/models/llama/modeling_llama.py` — `ThinkingResidualLambda` module, `thinking_residual_gate_r/i`, and the `thinking_residual()` blending function
-- `transformers/generation/utils.py` — generation-time logic that tracks `is_thinking`, builds `last_thinking_states` (probability-weighted embedding average), and switches between greedy/sampling via `is_inference`
+- `transformers/generation/utils.py` — generation-time logic that tracks `is_thinking`, builds `last_thinking_states` for residual reasoning, caches hidden states for time conditioning, and switches between greedy/sampling via `is_inference`
 - `unsloth/models/llama.py` — fast prefill (line ~663) and decode (line ~940) paths that apply `thinking_residual` blending
 
 When editing model code, **change both Qwen2 and LLaMA files** — they implement the same logic and must stay in sync.
@@ -25,13 +27,14 @@ When editing model code, **change both Qwen2 and LLaMA files** — they implemen
 ```
 hrpo_{gsm8k,math,mmlu,rag}.py          # Per-task training entry points
    └── unsloth.FastLanguageModel        # Loads base model w/ HRPO modules auto-attached
-   └── PEFT LoRA + modules_to_save      # Trains LoRA + thinking_residual_{gate_r,gate_i,Lambda}
+   └── PEFT LoRA + modules_to_save      # Saves LoRA plus residual/time-conditioning modules for the selected mode
    └── trl.GRPOTrainer                  # GRPO loop, group_size completions per prompt
-   └── patch.patch_trainer_optimizer    # Replaces create_optimizer with 4 param groups:
-                                        #   1. Decay LoRA params      → args.learning_rate
-                                        #   2. No-decay LoRA params   → args.learning_rate
-                                        #   3. thinking_residual_gate → lr_residual_gate (1e-4)
-                                        #   4. thinking_residual_Lambda → lr_residual_Lambda (1e-3)
+   └── patch.patch_trainer_optimizer    # Replaces create_optimizer with mode-aware families:
+                                        #   base LoRA params          → args.learning_rate
+                                        #   thinking_residual_gate    → lr_residual_gate (HRPO/THRPO)
+                                        #   thinking_residual_Lambda  → lr_residual_Lambda (HRPO/THRPO)
+                                        #   time_conditioning modules → lr_time_conditioning (TGRPO/THRPO)
+                                        # Each family is split into decay/no-decay groups when parameters exist.
 
 eval_{gsm8k,math,mmlust,rag,arcc}.py   # Per-task eval scripts
    └── Reads base model + mode + temperature from adapter_config.json:rot_metadata
@@ -41,7 +44,10 @@ eval_{gsm8k,math,mmlust,rag,arcc}.py   # Per-task eval scripts
 utils.py                                # ANSWER_START="####", SYSTEM_PROMPT,
                                         # mode parsing, adapter metadata IO,
                                         # reward_func_{math,mmlu,rag}, math/mmlu answer parsers
-patch.py                                # Optimizer surgery (4 param groups)
+time_conditioning.py                    # Predictor, Fourier time embedding, AdaLN projection,
+                                        # rollout/replay state, aux loss
+time_predictor_warmup.py                # Optional predictor-only warmup for TGRPO/THRPO
+patch.py                                # Optimizer surgery by parameter family
 prepare_data.py                         # Unified train + eval data preparation (all tasks)
 run_{grpo,tgrpo,hrpo,thrpo}_all.sh      # Unified train+eval orchestration with smart skip logic
 ```
@@ -60,6 +66,8 @@ Eval scripts no longer accept mode flags. They restore mode, base model, and tem
 ### Adapter Metadata (load-bearing)
 
 Every saved adapter config includes a `rot_metadata` block with the training mode, base model, task, temperature, and key hyperparameters. Eval loads this metadata instead of inferring anything from the checkpoint path. Directory naming is still useful for humans, but no longer load-bearing for runtime correctness.
+
+For time-conditioned checkpoints, `thinking_time_predictor_num_hidden_states` is load-bearing too. Resume uses it in the experiment directory name and validates it against metadata after finding a checkpoint; eval restores it directly from metadata so predictor input width matches the saved adapter.
 
 ## Common Commands
 
@@ -90,6 +98,9 @@ bash run_hrpo_all.sh --paper-params
 bash run_grpo_all.sh --tasks gsm8k --no-wandb
 bash run_tgrpo_all.sh --tasks gsm8k --no-wandb
 
+# Time-conditioned HRPO, with explicit predictor history and warmup fraction
+bash run_thrpo_all.sh --tasks gsm8k --predictor-hidden-states 3 --time-predictor-warmup-fraction 0.2
+
 # Dry run (print commands, don't execute)
 bash run_hrpo_all.sh --dry-run
 
@@ -100,6 +111,8 @@ python prepare_data.py --tasks rag --stage eval --with-retrieval  # RAG eval wit
 ```
 
 Smart skip: training is skipped if `experiments/{exp_name}/checkpoint-*` exists; eval is skipped if `eval_results*.json` exists in the checkpoint dir. Use `--resume` to continue training instead of skipping.
+
+Time-predictor warmup is only for `tgrpo` and `thrpo`. It is skipped on resume, uses a deterministic shuffled subset, freezes all non-predictor parameters, and writes no checkpoints.
 
 ### Individual scripts
 
@@ -128,9 +141,8 @@ When monitoring runs (WandB project: `latent-reasoning`):
 
 ## Environment Pinning Gotchas
 
-These are documented in `HRPO_REPRODUCTION_GUIDE.md` §7 and §8 — read that section before bumping any dep:
+These are documented in `HRPO_REPRODUCTION_GUIDE.md` under environment and version notes. Read that section before bumping dependencies:
 
-- `accelerate==1.5.2` (newer versions break the unsloth-patched `_fast_inner_training_loop` on `FP8BackendType`)
-- `tokenizers>=0.21,<0.22` (vendored `transformers/` requires this; unsloth pulls 0.22.x by default)
-- `torch==2.10.0+cu128` (unsloth caps at `torch<2.11.0`)
-- `peft==0.18.1`, `trl==0.24.0`, `datasets==4.3.0`, `bitsandbytes==0.49.2`, `math-verify==0.9.0`
+- `requirements.txt` currently pins `accelerate==1.5.2`, `datasets==3.4.1`, `peft==0.15.0`, `tokenizers==0.21.1`, `torch==2.5.1`, `vllm==0.7.3`, and `wandb==0.19.8`.
+- `transformers/`, `trl/`, and `unsloth/` are vendored and patched; do not replace them with upstream installs unless you re-audit residual and time-conditioning hooks.
+- Eval import order matters: use `utils.build_generation_config()` so Unsloth is imported before `GenerationConfig`.
